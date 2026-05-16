@@ -294,15 +294,25 @@ def install_pyodide_build_env(
     venv_bin = venv_dir / "bin"
     signature_file = install_dir / ".signature.json"
     src_dir = install_dir / "src"
+    # Keep the xbuildenv inside install_dir so it is removed by the
+    # existing shutil.rmtree on signature mismatch. Path is recorded
+    # in the signature so moving the prefix triggers reinstall.
+    xbuildenv_root = install_dir / "xbuildenv"
+    xbuildenv_installed_marker = xbuildenv_root / pyodide_version / ".installed"
     signature = {
         "tool": "pyodide-build",
         "pyodide_version": pyodide_version,
         "python_minor": python_minor,
         "uv_version": UV_VERSION,
         "pyodide_build_commit": PYODIDE_BUILD_COMMIT,
+        "xbuildenv_path": "xbuildenv",  # relative to install_dir
     }
 
-    if signature_matches(signature_file, signature) and (venv_bin / "pyodide").is_file():
+    if (
+        signature_matches(signature_file, signature)
+        and (venv_bin / "pyodide").is_file()
+        and xbuildenv_installed_marker.is_file()
+    ):
         print(f"pyodide-build for Pyodide {pyodide_version} already installed at {install_dir}")
         return venv_bin
 
@@ -345,12 +355,19 @@ def install_pyodide_build_env(
         str(src_dir),
     )
     execute(
-        f"Installing Pyodide xbuildenv for {pyodide_version}",
+        f"Installing Pyodide xbuildenv for {pyodide_version} into {xbuildenv_root}",
         str(venv_bin / "pyodide"),
         "xbuildenv",
         "install",
+        "--path",
+        str(xbuildenv_root),
         pyodide_version,
     )
+    if not xbuildenv_installed_marker.is_file():
+        sys.exit(
+            f"xbuildenv install reported success but marker is missing: "
+            f"{xbuildenv_installed_marker}"
+        )
 
     write_signature(signature_file, signature)
     return venv_bin
