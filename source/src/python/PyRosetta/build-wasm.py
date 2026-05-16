@@ -14,13 +14,20 @@ Build PyRosetta for WebAssembly (Pyodide).
 Sibling to build.py. Does not modify it. See
 ``.ai/adrs/0001-pyodide-integration.md`` for the full design.
 
-Current scope (task 0003): toolchain auto-install only. Running this
-script installs uv, Emscripten SDK, and a pyodide-build venv (with a
-matching CPython 3.13 fetched by uv) into a prefix directory under
-``source/build/PyRosetta-WASM/prefix/``. No PyRosetta build is run yet.
+Pipeline (task 0005):
+
+1. Phase 1 — install toolchain (uv, emsdk, pyodide-build) into
+   ``source/build/PyRosetta-WASM/prefix/``.
+2. Phase 2 — generation: shell out to ``build.py --skip-building-phase``
+   to run Binder and produce ``setup.py``. Skipped by
+   ``--skip-generation-phase``.
+3. Phase 3 — build: invoke ``pyodide build`` against the generated
+   ``setup.py``. Skipped by ``--skip-building-phase``.
 
 Host prerequisites:
     - git, curl, bash
+    - cmake, ninja, and a host C/C++ compiler (required by the inner
+      build.py / Binder build).
     - Python >= 3.8 to run this script (the build's target Python comes
       from uv).
 """
@@ -92,6 +99,16 @@ def build_root(build_type: str) -> Path:
         / f"python-{PYTHON_MINOR}"
         / config
     )
+
+
+def pyodide_build_install_dir(prefix_root: Path) -> Path:
+    return prefix_root / f"pyodide-build-{PYODIDE_VERSION}"
+
+
+def xbuildenv_root_for(prefix_root: Path) -> Path:
+    """Where ``pyodide xbuildenv install`` writes the cross-build env.
+    Shared between the installer and the build phase so they agree."""
+    return pyodide_build_install_dir(prefix_root) / "xbuildenv"
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +306,7 @@ def install_pyodide_build_env(
     """
     uv_bin = install_uv(prefix_root)
 
-    install_dir = prefix_root / f"pyodide-build-{pyodide_version}"
+    install_dir = pyodide_build_install_dir(prefix_root)
     venv_dir = install_dir / "venv"
     venv_bin = venv_dir / "bin"
     signature_file = install_dir / ".signature.json"
@@ -297,7 +314,7 @@ def install_pyodide_build_env(
     # Keep the xbuildenv inside install_dir so it is removed by the
     # existing shutil.rmtree on signature mismatch. Path is recorded
     # in the signature so moving the prefix triggers reinstall.
-    xbuildenv_root = install_dir / "xbuildenv"
+    xbuildenv_root = xbuildenv_root_for(prefix_root)
     xbuildenv_installed_marker = xbuildenv_root / pyodide_version / ".installed"
     signature = {
         "tool": "pyodide-build",
@@ -374,14 +391,107 @@ def install_pyodide_build_env(
 
 
 # ---------------------------------------------------------------------------
+# Generation phase — shell out to build.py --skip-building-phase.
+# ---------------------------------------------------------------------------
+def discover_inner_build_root(build_type: str) -> Path:
+    """Ask the inner build.py where it will write generation output.
+    The returned path is the binding build root; ``setup.py`` lives at
+    ``<root>/build/setup.py`` once the generation phase has run."""
+    result = subprocess.run(
+        [sys.executable, "build.py", "--print-build-root", "--type", build_type],
+        cwd=str(script_dir()),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return Path(result.stdout.strip())
+
+
+def run_generation_phase(args: argparse.Namespace) -> Path:
+    """Run ``build.py --skip-building-phase`` and return the inner
+    binding build root (the directory whose ``build/`` contains
+    ``setup.py`` afterwards)."""
+    inner_root = discover_inner_build_root(args.type)
+
+    cmd = [
+        sys.executable, "build.py",
+        "--skip-building-phase",
+        "--type", args.type,
+        "-j", str(args.jobs),
+    ]
+    if args.version_file:
+        cmd += ["--version", args.version_file]
+
+    execute(
+        "Running inner build.py generation phase (Binder + CMake configure)",
+        *cmd,
+        cwd=script_dir(),
+    )
+    return inner_root
+
+
+# ---------------------------------------------------------------------------
+# Build phase — invoke pyodide build against the generated setup.py.
+# ---------------------------------------------------------------------------
+def run_pyodide_build_phase(
+    prefix_root: Path,
+    pyodide_venv_bin: Path,
+    emsdk_env: Path,
+    args: argparse.Namespace,
+    inner_build_root: Path,
+) -> Path:
+    """Invoke ``pyodide build`` on ``<inner_build_root>/build/``. Returns
+    the outdir where wheels (if any) land."""
+    setup_dir = inner_build_root / "build"
+    setup_py = setup_dir / "setup.py"
+    if not setup_py.is_file():
+        sys.exit(
+            f"Expected setup.py at {setup_py} after the generation "
+            f"phase, but it is missing. The inner build.py may have "
+            f"changed; re-check the handoff path."
+        )
+
+    outdir = build_root(args.type) / "dist"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    xbuildenv = xbuildenv_root_for(prefix_root)
+    pyodide_bin = pyodide_venv_bin / "pyodide"
+
+    # Source emsdk_env.sh and set PYODIDE_XBUILDENV_PATH (task 0004) so
+    # pyodide-build finds the prefix-local xbuildenv.
+    shell_cmd = (
+        f"set -e && "
+        f"source {emsdk_env} >/dev/null && "
+        f"export PYODIDE_XBUILDENV_PATH={xbuildenv} && "
+        f"cd {setup_dir} && "
+        f"{pyodide_bin} build --outdir {outdir}"
+    )
+    execute_shell("Running pyodide build", shell_cmd)
+
+    wheels = sorted(outdir.glob("*.whl"))
+    if wheels:
+        print()
+        print(f"Wheels produced under {outdir}:")
+        for w in wheels:
+            print(f"  {w.name}")
+    else:
+        print()
+        print(f"WARNING: pyodide build exited 0 but no wheel was found in {outdir}")
+    return outdir
+
+
+# ---------------------------------------------------------------------------
 # CLI / main.
 # ---------------------------------------------------------------------------
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build PyRosetta for WebAssembly (Pyodide). "
-            "This sibling of build.py auto-installs the WASM toolchain "
-            "(uv, emsdk, pyodide-build) into source/build/PyRosetta-WASM/prefix/."
+            "Build PyRosetta for WebAssembly (Pyodide). Sibling of build.py. "
+            "Phase 1: auto-install the WASM toolchain (uv, emsdk, pyodide-build) "
+            "under source/build/PyRosetta-WASM/prefix/. "
+            "Phase 2: shell out to build.py --skip-building-phase for Binder + "
+            "CMake generation. "
+            "Phase 3: invoke `pyodide build` against the generated setup.py."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -396,12 +506,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--skip-generation-phase", action="store_true",
-        help="(Future task) Skip the inner build.py Binder run.",
+        help="Skip Phase 2 (inner build.py Binder/CMake generation). "
+             "Useful when iterating on Phase 3 with an already-generated "
+             "source tree.",
     )
     parser.add_argument(
         "--skip-building-phase", action="store_true",
-        help="(Future task) Skip the pyodide build step. "
-             "With this flag the script only installs the toolchain.",
+        help="Skip Phase 3 (pyodide build). With this flag the script "
+             "stops after the toolchain install (and generation, unless "
+             "--skip-generation-phase is also set).",
     )
     parser.add_argument(
         "--print-build-root", action="store_true",
@@ -418,7 +531,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--version-file", default=None,
-        help="(Future task) JSON version file (pass-through to inner build.py).",
+        help="JSON version file (pass-through to inner build.py --version).",
     )
     return parser.parse_args(argv)
 
@@ -442,10 +555,18 @@ def main(argv: list[str]) -> int:
     prefix = build_prefix_root()
     prefix.mkdir(parents=True, exist_ok=True)
 
+    phases = []
+    phases.append("toolchain install")
+    if not args.skip_generation_phase:
+        phases.append("generation (build.py --skip-building-phase)")
+    if not args.skip_building_phase:
+        phases.append("build (pyodide build)")
     print(f"PyRosetta-WASM toolchain prefix: {prefix}")
     print(f"PyRosetta-WASM build root:       {build_root(args.type)}")
+    print(f"Phases to run:                   {', '.join(phases)}")
     print()
 
+    # Phase 1.
     uv_bin = install_uv(prefix)
     emsdk_env = install_emsdk(prefix)
     pyodide_venv_bin = install_pyodide_build_env(prefix)
@@ -456,8 +577,22 @@ def main(argv: list[str]) -> int:
     print(f"  emsdk env script:    {emsdk_env}")
     print(f"  pyodide-build venv:  {pyodide_venv_bin}")
     print()
-    print("Next phases (build, test, package) not yet wired — task 0003 "
-          "delivers the toolchain bootstrap only.")
+
+    # Phase 2.
+    if args.skip_generation_phase:
+        print("Skipping generation phase (--skip-generation-phase).")
+        inner_build_root = discover_inner_build_root(args.type)
+    else:
+        inner_build_root = run_generation_phase(args)
+
+    # Phase 3.
+    if args.skip_building_phase:
+        print("Skipping build phase (--skip-building-phase). Done.")
+        return 0
+
+    run_pyodide_build_phase(
+        prefix, pyodide_venv_bin, emsdk_env, args, inner_build_root
+    )
     return 0
 
 
