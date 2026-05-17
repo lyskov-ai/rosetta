@@ -398,7 +398,7 @@ def discover_inner_build_root(build_type: str) -> Path:
     The returned path is the binding build root; ``setup.py`` lives at
     ``<root>/build/setup.py`` once the generation phase has run."""
     result = subprocess.run(
-        [sys.executable, "build.py", "--print-build-root", "--type", build_type],
+        [sys.executable, "build.py", "--print-build-root", "--target", "wasm", "--type", build_type],
         cwd=str(script_dir()),
         check=True,
         capture_output=True,
@@ -416,6 +416,7 @@ def run_generation_phase(args: argparse.Namespace) -> Path:
     cmd = [
         sys.executable, "build.py",
         "--skip-building-phase",
+        "--target", "wasm",
         "--type", args.type,
         "-j", str(args.jobs),
     ]

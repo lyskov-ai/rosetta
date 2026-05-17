@@ -161,11 +161,14 @@ def install_llvm_tool(name, source_location, prefix_root, debug, compiler, jobs,
 
     # llvm_version='9.0.0'  # v8 and v9 can not be build with Clang-3.4, we if need upgrade to v > 7 then we should probably dynamicly change LLVM version based on complier versions
     # llvm_version='7.1.0'  # compiling v7.* on clang-3.4 lead to lockup while compiling tools/clang/lib/Sema/SemaChecking.cpp
-    llvm_version, headers = ('13.0.0', 'tools/clang/lib/Headers/clang-resource-headers clang') if Platform == 'macos' and platform.machine() == 'arm64' else ('6.0.1', 'tools/clang/lib/Headers/clang-headers')
-    #llvm_version, headers = ('13.0.0', 'tools/clang/lib/Headers/clang-resource-headers clang') if Platform == 'macos' else ('6.0.1', 'tools/clang/lib/Headers/clang-headers')
-    #llvm_version, headers = ('13.0.0', 'tools/clang/lib/Headers/clang-resource-headers clang')
+    if Options.target == 'wasm':
+        llvm_version, headers = ('19.1.7', 'tools/clang/lib/Headers/clang-resource-headers clang')
+    else:
+        llvm_version, headers = ('13.0.0', 'tools/clang/lib/Headers/clang-resource-headers clang') if Platform == 'macos' and platform.machine() == 'arm64' else ('6.0.1', 'tools/clang/lib/Headers/clang-headers')
+        #llvm_version, headers = ('13.0.0', 'tools/clang/lib/Headers/clang-resource-headers clang') if Platform == 'macos' else ('6.0.1', 'tools/clang/lib/Headers/clang-headers')
+        #llvm_version, headers = ('13.0.0', 'tools/clang/lib/Headers/clang-resource-headers clang')
 
-    if Platform == 'macos'  and  tuple( platform.mac_ver()[0].split('.') ) >= ('13','3') : llvm_version, headers = ('13.0.0', 'tools/clang/lib/Headers/clang-resource-headers clang')
+        if Platform == 'macos'  and  tuple( platform.mac_ver()[0].split('.') ) >= ('13','3') : llvm_version, headers = ('13.0.0', 'tools/clang/lib/Headers/clang-resource-headers clang')
     #print(f'{Platform=} {llvm_version=}')
 
     prefix = prefix_root + '/llvm-' + llvm_version
@@ -192,12 +195,13 @@ def install_llvm_tool(name, source_location, prefix_root, debug, compiler, jobs,
 
         clang_path = "{prefix}/tools/clang".format(**locals())
 
-        llvm_url, clang_url = {
-            '6.0.1'  : ('https://releases.llvm.org/6.0.1/llvm-6.0.1.src.tar.xz', 'https://releases.llvm.org/6.0.1/cfe-6.0.1.src.tar.xz'),
-            '13.0.0' : ('https://github.com/llvm/llvm-project/releases/download/llvmorg-13.0.0/llvm-13.0.0.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-13.0.0/clang-13.0.0.src.tar.xz'),
-            '14.0.6' : ('https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/llvm-14.0.6.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/clang-14.0.6.src.tar.xz'),
-            '15.0.7' : ('https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.7/llvm-15.0.7.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.7/clang-15.0.7.src.tar.xz'),
-            '16.0.0' : ('https://github.com/llvm/llvm-project/releases/download/llvmorg-16.0.0/llvm-16.0.0.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-16.0.0/clang-16.0.0.src.tar.xz'),
+        llvm_url, clang_url, cmake_url = {
+            '6.0.1'  : ('https://releases.llvm.org/6.0.1/llvm-6.0.1.src.tar.xz', 'https://releases.llvm.org/6.0.1/cfe-6.0.1.src.tar.xz', None),
+            '13.0.0' : ('https://github.com/llvm/llvm-project/releases/download/llvmorg-13.0.0/llvm-13.0.0.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-13.0.0/clang-13.0.0.src.tar.xz', None),
+            '14.0.6' : ('https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/llvm-14.0.6.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.6/clang-14.0.6.src.tar.xz', None),
+            '15.0.7' : ('https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.7/llvm-15.0.7.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.7/clang-15.0.7.src.tar.xz', None),
+            '16.0.0' : ('https://github.com/llvm/llvm-project/releases/download/llvmorg-16.0.0/llvm-16.0.0.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-16.0.0/clang-16.0.0.src.tar.xz', None),
+            '19.1.7' : ('https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/llvm-19.1.7.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/clang-19.1.7.src.tar.xz', 'https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/cmake-19.1.7.src.tar.xz'),
         }[llvm_version]
 
         if not os.path.isfile(prefix + '/CMakeLists.txt'):
@@ -207,6 +211,28 @@ def install_llvm_tool(name, source_location, prefix_root, debug, compiler, jobs,
         if not os.path.isdir(clang_path):
             #execute('Download Clang source...', 'cd {prefix_root} && curl https://releases.llvm.org/{llvm_version}/cfe-{llvm_version}.src.tar.xz | tar -Jxom && mv cfe-{llvm_version}.src {clang_path}'.format(**locals()) )
             execute('Download Clang source...', 'cd {prefix_root} && mkdir clang-{llvm_version}.src && curl -LJ {clang_url} | tar --strip-components=1 -Jxom -C clang-{llvm_version}.src && mv clang-{llvm_version}.src {clang_path}'.format(**locals()) )
+
+        # Post-monorepo LLVM releases (>= ~14) split shared CMake utilities and
+        # third-party/unittest out of the main llvm-X.Y.Z.src archive. The
+        # llvm/clang CMakeLists reference them via ${LLVM_MAIN_SRC_DIR}/../cmake
+        # and ${LLVM_MAIN_SRC_DIR}/../third-party. When the version table sets
+        # cmake_url, materialize that sibling layout under prefix_root. The
+        # marker file `<cmake>/llvm_version.txt` makes the cmake-sibling
+        # idempotent across version switches; native LLVM 6.0.1 has
+        # cmake_url=None and skips this block entirely.
+        if cmake_url:
+            cmake_path = os.path.join(prefix_root, 'cmake')
+            cmake_version_path = os.path.join(cmake_path, 'llvm_version.txt')
+            if (not os.path.isfile(cmake_version_path)) or open(cmake_version_path).read() != llvm_version:
+                if os.path.isdir(cmake_path): shutil.rmtree(cmake_path)
+                os.makedirs(cmake_path)
+                execute('Download CMake source...', 'cd {prefix_root} && curl -LJ {cmake_url} | tar --strip-components=1 -Jxom -C cmake'.format(**locals()))
+                with open(cmake_version_path, 'w') as f: f.write(llvm_version)
+
+            third_party_unittest = os.path.join(prefix_root, 'third-party', 'unittest')
+            if not os.path.isdir(third_party_unittest):
+                os.makedirs(third_party_unittest)
+                with open(os.path.join(third_party_unittest, 'CMakeLists.txt'), 'w') as f: f.write('')
 
         if not os.path.isdir(prefix+'/tools/clang/tools/extra'): os.makedirs(prefix+'/tools/clang/tools/extra')
 
@@ -247,12 +273,18 @@ def install_llvm_tool(name, source_location, prefix_root, debug, compiler, jobs,
         config += get_cmake_compiler_options()
 
         if not os.path.isdir(build_dir): os.makedirs(build_dir)
+        # Post-monorepo LLVM (cmake_url set) references third-party/benchmark from
+        # its top-level CMakeLists. Rather than fetch the benchmark sources, disable
+        # the benchmark subproject — Binder doesn't need it. Native LLVM 6.0.1 has
+        # cmake_url=None and gets the original cmake invocation byte-identically.
+        include_benchmarks = '-DLLVM_INCLUDE_BENCHMARKS=OFF' if cmake_url else ''
         execute(
             'Building tool: {}...'.format(name), # -DLLVM_TEMPORARILY_ALLOW_OLD_TOOLCHAIN=1
-            'cd {build_dir} && cmake -G Ninja {config} -DLLVM_ENABLE_EH=1 -DLLVM_ENABLE_RTTI=ON {gcc_install_prefix} .. && ninja binder {headers} {jobs}'.format( # was 'binder clang', we need to build Clang so lib/clang/<version>/include is also built
+            'cd {build_dir} && cmake -G Ninja {config} -DLLVM_ENABLE_EH=1 -DLLVM_ENABLE_RTTI=ON {include_benchmarks} {gcc_install_prefix} .. && ninja binder {headers} {jobs}'.format( # was 'binder clang', we need to build Clang so lib/clang/<version>/include is also built
                 build_dir=build_dir, config=config,
                 jobs=f'-j{jobs}' if jobs else '',
                 gcc_install_prefix='-DGCC_INSTALL_PREFIX='+gcc_install_prefix if gcc_install_prefix else '',
+                include_benchmarks=include_benchmarks,
                 headers=headers,
             ),
             silence_output=True)
@@ -316,6 +348,7 @@ def get_binding_build_root(rosetta_source_path, source=False, build=False, docum
     p =  os.path.join(p, platform.platform() + '/' + get_compiler_family() + '-' + get_compiler_version() + '/python-' + _python_version_)
 
     p = os.path.join(p, Options.type.lower()
+                     + ('.wasm' if Options.target == 'wasm' else '')
                      + ('.serialization' if Options.serialization else '')
                      + ('.thread' if Options.multi_threaded else '')
                      + ('.torch' if Options.torch else '')
@@ -891,6 +924,7 @@ def main(args):
     parser.add_argument("--binder-config", action="append", default=["rosetta.config"], help="Binder config file. [Default='rosetta.config']")
     parser.add_argument("--print-build-root", action="store_true", help="Print path to where PyRosetta binaries will be located with given build options and exit. Use this option to automate package creation.")
     parser.add_argument('--cross-compile', action="store_true", help='Specify for cross-compile build')
+    parser.add_argument('--target', default='native', choices=['native', 'wasm'], help='Build target. "native" (default) preserves existing behaviour. "wasm" selects a modern LLVM/Clang for Binder and applies WASM-friendly build defaults (no ZeroMQ, distinct build root).')
     parser.add_argument('--pybind11', default='', help='Path to pybind11 source tree')
     parser.add_argument('--annotate-includes', action="store_true", help='Annotate includes in generated PyRosetta source files')
     parser.add_argument('--trace', action="store_true", help='Binder will add trace output to the generated PyRosetta source files')
@@ -929,6 +963,11 @@ def main(args):
 
     global Options
     Options = parser.parse_args()
+
+    if Options.target == 'wasm':
+        if Options.zmq:
+            print('NOTE: --target wasm overrides --zmq default; building without ZeroMQ.')
+        Options.zmq = False
 
     #Options.build_suffix =  _machine_name_ if Options.build_suffix is None else Options.build_suffix
 
