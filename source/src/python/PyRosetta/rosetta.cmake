@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.10)
 
 # enabling IN_LIST operator https://cmake.org/cmake/help/v3.7/policy/CMP0057.html
 # cmake_policy(SET CMP0057 NEW)
