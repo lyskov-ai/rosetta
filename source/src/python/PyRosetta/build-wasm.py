@@ -404,7 +404,13 @@ def discover_inner_build_root(build_type: str) -> Path:
         capture_output=True,
         text=True,
     )
-    return Path(result.stdout.strip())
+    # Inner build.py may emit informational lines (e.g. the WASM `NOTE:`)
+    # before the build-root path. The path is always the final non-empty
+    # stdout line.
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if not lines:
+        sys.exit("build.py --print-build-root produced no output")
+    return Path(lines[-1].strip())
 
 
 def run_generation_phase(args: argparse.Namespace) -> Path:
