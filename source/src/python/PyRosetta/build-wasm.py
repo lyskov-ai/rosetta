@@ -11,18 +11,24 @@
 """
 Build PyRosetta for WebAssembly (Pyodide).
 
-Sibling to build.py. Does not modify it. See
-``.ai/adrs/0001-pyodide-integration.md`` for the full design.
+Sibling to build.py. See ``.ai/adrs/0001-pyodide-integration.md`` for
+the full design and ``.ai/specs/0008-cross-compile-pyrosetta-to-wasm.md``
+for the cross-compile interface (Approach B).
 
-Pipeline (task 0005):
+Pipeline:
 
 1. Phase 1 — install toolchain (uv, emsdk, pyodide-build) into
    ``source/build/PyRosetta-WASM/prefix/``.
-2. Phase 2 — generation: shell out to ``build.py --skip-building-phase``
-   to run Binder and produce ``setup.py``. Skipped by
-   ``--skip-generation-phase``.
-3. Phase 3 — build: invoke ``pyodide build`` against the generated
-   ``setup.py``. Skipped by ``--skip-building-phase``.
+2. Phase 2 — build: source ``emsdk_env.sh`` and invoke
+   ``build.py --target wasm`` with Pyodide's cross-compile flags
+   (``--cmake-toolchain``, ``--cflags``, ``--cxxflags``, ``--ldflags``,
+   ``--python-include-dir``, ``--python-version``). build.py runs
+   Binder + CMake configure + ninja end-to-end and emits a
+   ``rosetta.so`` (wasm32-emscripten) under ``<build>/pyrosetta/``.
+   Skipped by ``--skip-build-phase``.
+3. Phase 3 — package: invoke ``pyodide build`` against the resulting
+   ``setup.py``. The wheel post-processor renames the ``.so`` to
+   carry the Pyodide ABI tag. Skipped by ``--skip-pyodide-build-phase``.
 
 Host prerequisites:
     - git, curl, bash
@@ -39,6 +45,7 @@ import hashlib
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -391,12 +398,12 @@ def install_pyodide_build_env(
 
 
 # ---------------------------------------------------------------------------
-# Generation phase — shell out to build.py --skip-building-phase.
+# Build phase — shell out to build.py (Binder + CMake + ninja, end-to-end).
 # ---------------------------------------------------------------------------
 def discover_inner_build_root(build_type: str) -> Path:
     """Ask the inner build.py where it will write generation output.
     The returned path is the binding build root; ``setup.py`` lives at
-    ``<root>/build/setup.py`` once the generation phase has run."""
+    ``<root>/build/setup.py`` once the build phase has run."""
     result = subprocess.run(
         [sys.executable, "build.py", "--print-build-root", "--target", "wasm", "--type", build_type],
         cwd=str(script_dir()),
@@ -413,25 +420,133 @@ def discover_inner_build_root(build_type: str) -> Path:
     return Path(lines[-1].strip())
 
 
-def run_generation_phase(args: argparse.Namespace) -> Path:
-    """Run ``build.py --skip-building-phase`` and return the inner
-    binding build root (the directory whose ``build/`` contains
-    ``setup.py`` afterwards)."""
-    inner_root = discover_inner_build_root(args.type)
+def pyodide_config_dict(prefix_root: Path, pyodide_venv_bin: Path) -> dict[str, str]:
+    """Parse ``pyodide config list`` into a dict. Values are stripped of
+    their surrounding double quotes.
 
-    cmd = [
-        sys.executable, "build.py",
-        "--skip-building-phase",
+    Sets ``PYODIDE_XBUILDENV_PATH`` so pyodide resolves to the
+    project-prefix xbuildenv (task 0004) rather than its default
+    ``~/.cache/.pyodide-xbuildenv-*`` fallback."""
+    pyodide_bin = pyodide_venv_bin / "pyodide"
+    env = os.environ.copy()
+    env["PYODIDE_XBUILDENV_PATH"] = str(xbuildenv_root_for(prefix_root))
+    result = subprocess.run(
+        [str(pyodide_bin), "config", "list"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    config: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        config[key.strip()] = value.strip().strip('"')
+    return config
+
+
+def ensure_libpython_stub(prefix_root: Path, py_minor: str) -> Path:
+    """Pyodide's xbuildenv ships only Python headers, not a libpython
+    archive — SIDE_MODULE wheels resolve Python symbols at import time
+    via Pyodide's runtime, so no static link is needed. CMake's
+    ``find_package(PythonLibs)`` insists on a file, though. Create an
+    empty stub once under the prefix and hand it back; on Linux
+    rosetta.cmake does not actually link against it (only Windows does)."""
+    stub_dir = prefix_root / "wasm-stubs"
+    stub_dir.mkdir(parents=True, exist_ok=True)
+    stub = stub_dir / f"libpython{py_minor}.so"
+    if not stub.exists():
+        stub.touch()
+    return stub
+
+
+def ensure_zlib_stub(prefix_root: Path) -> tuple[Path, Path]:
+    """Provide a zlib include dir + library stub for CMake's
+    ``find_package(ZLIB REQUIRED)`` call in rosetta.cmake. Emscripten's
+    SIDE_MODULE wheels resolve zlib symbols against the Pyodide runtime
+    at import time, so the library file is unused at link time — but
+    cmake still demands a real path. Headers come from the host
+    (``/usr/include/zlib.h`` + ``zconf.h``); the library is an empty
+    stub. Returns ``(include_dir, library_file)``."""
+    stub_dir = prefix_root / "wasm-stubs" / "zlib"
+    include_dir = stub_dir / "include"
+    library_file = stub_dir / "libz.so"
+    include_dir.mkdir(parents=True, exist_ok=True)
+    for header in ("zlib.h", "zconf.h"):
+        host_header = Path("/usr/include") / header
+        target = include_dir / header
+        if not target.exists():
+            if not host_header.is_file():
+                sys.exit(
+                    f"Cannot find host zlib header {host_header}. Install "
+                    f"`zlib1g-dev` (or equivalent) and re-run."
+                )
+            shutil.copy2(host_header, target)
+    if not library_file.exists():
+        library_file.touch()
+    return include_dir, library_file
+
+
+def run_build_phase(
+    args: argparse.Namespace,
+    prefix_root: Path,
+    emsdk_env: Path,
+    pyodide_venv_bin: Path,
+) -> Path:
+    """Run ``build.py --target wasm`` end-to-end (Binder + CMake configure
+    + ninja) under a sourced emsdk env, with Pyodide's cross-compile flags
+    forwarded via the new build.py options. Returns the inner binding
+    build root (the directory whose ``build/`` contains ``setup.py``)."""
+    inner_root = discover_inner_build_root(args.type)
+    config = pyodide_config_dict(prefix_root, pyodide_venv_bin)
+    required_keys = (
+        "cmake_toolchain_file", "python_include_dir",
+        "cflags", "cxxflags", "ldflags", "python_version",
+    )
+    missing = [k for k in required_keys if not config.get(k)]
+    if missing:
+        sys.exit(f"`pyodide config list` is missing required keys: {missing}")
+
+    py_minor = ".".join(config["python_version"].split(".")[:2])
+    python_lib_stub = ensure_libpython_stub(prefix_root, py_minor)
+    zlib_include_dir, zlib_library = ensure_zlib_stub(prefix_root)
+
+    # Rosetta-WASM-specific C++ defines layered on top of Pyodide's cxxflags.
+    # -DUNUSUAL_ALLOCATOR_DECLARATION: swap the `namespace std { template<typename>
+    #  class allocator; }` forward-declaration in vector{0,1,L}.fwd.hh for a
+    #  plain `#include <vector>`. The forward-decl form is ambiguous against
+    #  emscripten's versioned-namespace libc++ (std::__2::allocator).
+    rosetta_cxx_defines = "-DUNUSUAL_ALLOCATOR_DECLARATION"
+    cxxflags = config["cxxflags"] + " " + rosetta_cxx_defines
+
+    inner_args = [
+        "build.py",
         "--target", "wasm",
+        "--cmake-toolchain", config["cmake_toolchain_file"],
+        "--python-include-dir", config["python_include_dir"],
+        "--python-lib", str(python_lib_stub),
+        "--cflags", config["cflags"],
+        "--cxxflags", cxxflags,
+        "--ldflags", config["ldflags"],
+        "--python-version", py_minor,
+        "--zlib-include-dir", str(zlib_include_dir),
+        "--zlib-library", str(zlib_library),
         "--type", args.type,
         "-j", str(args.jobs),
     ]
     if args.version_file:
-        cmd += ["--version", args.version_file]
+        inner_args += ["--version", args.version_file]
 
-    execute(
-        "Running inner build.py generation phase (Binder + CMake configure)",
-        *cmd,
+    quoted = " ".join(shlex.quote(a) for a in inner_args)
+    shell_cmd = (
+        f"set -e && "
+        f"source {shlex.quote(str(emsdk_env))} >/dev/null && "
+        f"{shlex.quote(sys.executable)} {quoted}"
+    )
+    execute_shell(
+        "Running inner build.py (Binder + CMake + ninja) under emsdk env",
+        shell_cmd,
         cwd=script_dir(),
     )
     return inner_root
@@ -496,9 +611,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Build PyRosetta for WebAssembly (Pyodide). Sibling of build.py. "
             "Phase 1: auto-install the WASM toolchain (uv, emsdk, pyodide-build) "
             "under source/build/PyRosetta-WASM/prefix/. "
-            "Phase 2: shell out to build.py --skip-building-phase for Binder + "
-            "CMake generation. "
-            "Phase 3: invoke `pyodide build` against the generated setup.py."
+            "Phase 2: source emsdk_env.sh and invoke build.py --target wasm "
+            "(Binder + CMake configure + ninja, all in one). "
+            "Phase 3: invoke `pyodide build` against the resulting setup.py to "
+            "package a wheel with the cross-compiled extension module."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -512,16 +628,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Build type. Default Release.",
     )
     parser.add_argument(
-        "--skip-generation-phase", action="store_true",
-        help="Skip Phase 2 (inner build.py Binder/CMake generation). "
-             "Useful when iterating on Phase 3 with an already-generated "
-             "source tree.",
+        "--skip-build-phase", action="store_true",
+        help="Skip Phase 2 (inner build.py: Binder + CMake + ninja). "
+             "Useful when iterating on Phase 3 against an already-built "
+             "tree.",
     )
     parser.add_argument(
-        "--skip-building-phase", action="store_true",
-        help="Skip Phase 3 (pyodide build). With this flag the script "
-             "stops after the toolchain install (and generation, unless "
-             "--skip-generation-phase is also set).",
+        "--skip-pyodide-build-phase", action="store_true",
+        help="Skip Phase 3 (pyodide build). The script stops after Phase 2 "
+             "(or after the toolchain install if --skip-build-phase is also "
+             "set).",
     )
     parser.add_argument(
         "--print-build-root", action="store_true",
@@ -564,10 +680,10 @@ def main(argv: list[str]) -> int:
 
     phases = []
     phases.append("toolchain install")
-    if not args.skip_generation_phase:
-        phases.append("generation (build.py --skip-building-phase)")
-    if not args.skip_building_phase:
-        phases.append("build (pyodide build)")
+    if not args.skip_build_phase:
+        phases.append("build (build.py --target wasm: Binder + CMake + ninja)")
+    if not args.skip_pyodide_build_phase:
+        phases.append("package (pyodide build)")
     print(f"PyRosetta-WASM toolchain prefix: {prefix}")
     print(f"PyRosetta-WASM build root:       {build_root(args.type)}")
     print(f"Phases to run:                   {', '.join(phases)}")
@@ -586,15 +702,15 @@ def main(argv: list[str]) -> int:
     print()
 
     # Phase 2.
-    if args.skip_generation_phase:
-        print("Skipping generation phase (--skip-generation-phase).")
+    if args.skip_build_phase:
+        print("Skipping build phase (--skip-build-phase).")
         inner_build_root = discover_inner_build_root(args.type)
     else:
-        inner_build_root = run_generation_phase(args)
+        inner_build_root = run_build_phase(args, prefix, emsdk_env, pyodide_venv_bin)
 
     # Phase 3.
-    if args.skip_building_phase:
-        print("Skipping build phase (--skip-building-phase). Done.")
+    if args.skip_pyodide_build_phase:
+        print("Skipping pyodide build phase (--skip-pyodide-build-phase). Done.")
         return 0
 
     run_pyodide_build_phase(

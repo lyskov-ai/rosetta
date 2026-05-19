@@ -17,7 +17,7 @@
 
 from __future__ import print_function
 
-import os, sys, argparse, platform, subprocess, shutil, codecs, json, hashlib
+import os, sys, argparse, platform, subprocess, shutil, codecs, json, hashlib, shlex
 
 try:
     from setuptools.distutils import dir_util as dir_util_module
@@ -649,14 +649,47 @@ def run_cmake(rosetta_source_path):
 
     config = '-DCMAKE_BUILD_TYPE={}'.format(Options.type)
     config += ' -DPYROSETTA_STRIP_MODULE={build_type}'.format(build_type="TRUE" if Options.strip_module else "FALSE")
-    config += get_cmake_compiler_options()
+    # On --target wasm with a CMake toolchain file, let the toolchain file
+    # pick the compilers (emcc/em++); native -DCMAKE_C_COMPILER=clang would
+    # silently override it.
+    if not (Options.target == 'wasm' and Options.cmake_toolchain):
+        config += get_cmake_compiler_options()
 
     # if we ever go back to use static libs for intermediates: fix this on Mac: -DCMAKE_RANLIB=/usr/bin/ranlib -DCMAKE_AR=/usr/bin/ar
 
-    execute('Running CMake...', 'cd {prefix} && cmake -G Ninja {} -DPYROSETTA_PYTHON_VERSION={python_version}{py_lib}{py_include}{gcc_install_prefix} ../source'.format(config, prefix=prefix, python_version=_python_version_,
+    if Options.target == 'wasm':
+        # If the build dir was previously configured with a native compiler,
+        # CMake will refuse to switch to the emcc toolchain. Wipe the
+        # compiler-identification state so the toolchain file can take effect.
+        # We only touch CMake's own state files; the setup.py/setup.cfg
+        # symlinks and any ninja artefacts stay in place.
+        cache_file = prefix + 'CMakeCache.txt'
+        if os.path.isfile(cache_file):
+            with open(cache_file) as f: cache_text = f.read()
+            if '/emcc' not in cache_text:
+                print('NOTE: --target wasm wiping stale (non-emcc) CMakeCache at {}'.format(cache_file))
+                os.remove(cache_file)
+                cmake_files = prefix + 'CMakeFiles'
+                if os.path.isdir(cmake_files): shutil.rmtree(cmake_files)
+
+    python_version = Options.python_version or _python_version_
+
+    wasm_extras = ''
+    if Options.target == 'wasm':
+        if Options.cmake_toolchain:  wasm_extras += ' -DCMAKE_TOOLCHAIN_FILE=' + Options.cmake_toolchain
+        if Options.cflags:           wasm_extras += ' -DCMAKE_C_FLAGS=' + shlex.quote(Options.cflags)
+        if Options.cxxflags:         wasm_extras += ' -DCMAKE_CXX_FLAGS=' + shlex.quote(Options.cxxflags)
+        if Options.ldflags:
+            wasm_extras += ' -DCMAKE_EXE_LINKER_FLAGS=' + shlex.quote(Options.ldflags)
+            wasm_extras += ' -DCMAKE_SHARED_LINKER_FLAGS=' + shlex.quote(Options.ldflags)
+        if Options.zlib_include_dir: wasm_extras += ' -DZLIB_INCLUDE_DIR=' + Options.zlib_include_dir
+        if Options.zlib_library:     wasm_extras += ' -DZLIB_LIBRARY=' + Options.zlib_library
+
+    execute('Running CMake...', 'cd {prefix} && cmake -G Ninja {} -DPYROSETTA_PYTHON_VERSION={python_version}{py_lib}{py_include}{gcc_install_prefix}{wasm_extras} ../source'.format(config, prefix=prefix, python_version=python_version,
                                                                                                                                                                         py_lib=' -DPYTHON_LIBRARY='+Options.python_lib if Options.python_lib else '',
                                                                                                                                                                         py_include=' -DPYTHON_INCLUDE_DIR='+Options.python_include_dir if Options.python_include_dir else '',
-                                                                                                                                                                        gcc_install_prefix=' -DGCC_INSTALL_PREFIX='+Options.gcc_install_prefix if Options.gcc_install_prefix else ''))
+                                                                                                                                                                        gcc_install_prefix=' -DGCC_INSTALL_PREFIX='+Options.gcc_install_prefix if Options.gcc_install_prefix else '',
+                                                                                                                                                                        wasm_extras=wasm_extras))
     sys.stdout.flush()
 
 
@@ -761,7 +794,10 @@ def generate_bindings(rosetta_source_path):
     with open(prefix+'rosetta.sources') as f: sources = f.read().split()
     modified = generate_cmake_file(rosetta_source_path, sources)
 
-    if modified or (signature != disk_signature) or cmake_needs_to_be_run(rosetta_source_path): run_cmake(rosetta_source_path)
+    # On --target wasm, always rerun cmake: the WASM-specific flags (toolchain,
+    # cflags/cxxflags/ldflags, zlib/python overrides) are caller-supplied and
+    # the disk-signature/CMakeLists.txt-mtime check is blind to changes in them.
+    if Options.target == 'wasm' or modified or (signature != disk_signature) or cmake_needs_to_be_run(rosetta_source_path): run_cmake(rosetta_source_path)
     else: print('No changes in source files detected, skipping CMake run...')
 
 
@@ -936,6 +972,13 @@ def main(args):
 
     parser.add_argument('--python-include-dir', default=None, help='Path to python C headers. Use this if CMake fails to autodetect it')
     parser.add_argument('--python-lib', default=None, help='Path to python library. Use this if CMake fails to autodetect it')
+    parser.add_argument('--python-version', default=None, help='Override the target Python X.Y version (default: the interpreter running build.py). Used by --target wasm to bind against Pyodide\'s Python rather than the host.')
+    parser.add_argument('--cmake-toolchain', default=None, help='Path to a CMake toolchain file (forwarded as -DCMAKE_TOOLCHAIN_FILE=...). --target wasm only.')
+    parser.add_argument('--cflags', default=None, help='Extra C compiler flags (forwarded as -DCMAKE_C_FLAGS=...). --target wasm only.')
+    parser.add_argument('--cxxflags', default=None, help='Extra C++ compiler flags (forwarded as -DCMAKE_CXX_FLAGS=...). --target wasm only.')
+    parser.add_argument('--ldflags', default=None, help='Extra linker flags (forwarded as -DCMAKE_EXE_LINKER_FLAGS=... and -DCMAKE_SHARED_LINKER_FLAGS=...). --target wasm only.')
+    parser.add_argument('--zlib-include-dir', default=None, help='Path to zlib headers (forwarded as -DZLIB_INCLUDE_DIR=...). --target wasm only.')
+    parser.add_argument('--zlib-library', default=None, help='Path to libz file (forwarded as -DZLIB_LIBRARY=...). --target wasm only.')
 
     parser.add_argument('--gcc-install-prefix', default=None, help='Path to GCC install prefix which will be used to determent location of libstdc++ for Binder build. Default is: auto-detected. Use this option if you would like to build Binder with compiler that was side-installed and which LLVM build system failed to identify. To see what path Binder uses for libstdc++ run `binder -- -xc++ -E -v`.')
 
@@ -968,6 +1011,10 @@ def main(args):
         if Options.zmq:
             print('NOTE: --target wasm overrides --zmq default; building without ZeroMQ.')
         Options.zmq = False
+    else:
+        for name in ('cmake_toolchain', 'cflags', 'cxxflags', 'ldflags', 'zlib_include_dir', 'zlib_library'):
+            if getattr(Options, name) is not None:
+                sys.exit('ERROR: --{} is only valid with --target wasm'.format(name.replace('_', '-')))
 
     #Options.build_suffix =  _machine_name_ if Options.build_suffix is None else Options.build_suffix
 
