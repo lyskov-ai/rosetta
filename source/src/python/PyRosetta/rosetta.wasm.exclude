@@ -1,0 +1,12 @@
+# Rosetta C++ TUs to exclude from the per-library OBJECT add_library()
+# blocks when build.py runs with --target wasm. One source path per
+# line, relative to source/src/. The `.cc` suffix is optional (the
+# loader normalises). Comments (`#`) and blank lines are ignored.
+#
+# Loaded by build.py:generate_rosetta_cmake_files when
+# Options.target == 'wasm'. See task 0014.
+
+# boost::lexical_cast<Size>(version) at line 157 → boost::numeric MPL
+# chain → integral_c<…, -1>::prior fails strict-constexpr on
+# emscripten libc++.
+core/scoring/constraints/SequenceProfileConstraint.cc

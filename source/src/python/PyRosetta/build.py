@@ -504,10 +504,35 @@ def generate_rosetta_external_cmake_files(rosetta_source_path, prefix):
     return list( libs.keys() ), modified
 
 
+_wasm_excludes_cache = None
+def _load_wasm_excludes():
+    ''' Return frozenset of source paths (relative to source/src/, `.cc`
+    suffix stripped) excluded from per-library OBJECT add_library()
+    blocks under --target wasm. Empty set when --target wasm is not
+    selected or when rosetta.wasm.exclude is missing. Cached so the
+    file is read at most once per build.py invocation. '''
+    global _wasm_excludes_cache
+    if _wasm_excludes_cache is not None: return _wasm_excludes_cache
+    if Options.target != 'wasm' or not os.path.isfile('rosetta.wasm.exclude'):
+        _wasm_excludes_cache = frozenset()
+        return _wasm_excludes_cache
+    entries = set()
+    with open('rosetta.wasm.exclude') as f:
+        for raw in f:
+            line = raw.split('#', 1)[0].strip()
+            if not line: continue
+            if line.endswith('.cc'): line = line[:-3]
+            entries.add(line)
+    _wasm_excludes_cache = frozenset(entries)
+    return _wasm_excludes_cache
+
+
 def generate_rosetta_cmake_files(rosetta_source_path, prefix):
     scons_file_prefix = './../../../src/'
     lib_suffix = '.src.settings'
     libs = []
+    wasm_excludes = _load_wasm_excludes()
+    wasm_excluded_count = 0
 
     all_libs = [ f[:-len(lib_suffix)] for f in os.listdir(scons_file_prefix)
                  if f.endswith(lib_suffix) and f not in ['apps.src.settings', 'pilot_apps.src.settings', 'devel.src.settings',]
@@ -552,6 +577,13 @@ def generate_rosetta_cmake_files(rosetta_source_path, prefix):
             for h in os.listdir(scons_file_prefix + dir_):
                 if h.endswith('.hh') or h.endswith('.h'): sources.append(dir_ + '/' + h)
 
+        if wasm_excludes:
+            filtered = []
+            for s in sources:
+                key = s[:-3] if s.endswith('.cc') else s
+                if key in wasm_excludes: wasm_excluded_count += 1
+                else: filtered.append(s)
+            sources = filtered
 
         sources.sort()
 
@@ -567,6 +599,9 @@ def generate_rosetta_cmake_files(rosetta_source_path, prefix):
         modified |= update_source_file(prefix + lib + '.cmake', t)
 
         libs.append(lib)
+
+    if wasm_excluded_count:
+        print('NOTE: --target wasm: excluded {} translation unit(s) per rosetta.wasm.exclude'.format(wasm_excluded_count))
 
     return libs, modified
 
@@ -755,6 +790,8 @@ def generate_bindings(rosetta_source_path):
         with open(config_file) as f: config += f.read()
 
     if 'clang' not in Options.compiler: config += open('rosetta.gcc.config').read()
+    if Options.target == 'wasm' and os.path.isfile('rosetta.wasm.config'):
+        config += '\n# rosetta.wasm.config\n' + open('rosetta.wasm.config').read()
     with open(prefix + 'rosetta.config', 'w') as f: f.write(config)
     signature_update(config)
 
