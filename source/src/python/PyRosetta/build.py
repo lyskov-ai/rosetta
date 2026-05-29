@@ -84,7 +84,7 @@ def get_rosetta_include_directories():
 def get_defines():
     ''' return list of #defines '''
     defines = 'PYROSETTA NOCRASHREPORT BOOST_ERROR_CODE_HEADER_ONLY BOOST_SYSTEM_NO_DEPRECATED BOOST_MATH_NO_LONG_DOUBLE_MATH_FUNCTIONS PTR_STD' # USEBCL
-    if Platform == 'macos': defines += ' UNUSUAL_ALLOCATOR_DECLARATION'
+    if Platform == 'macos' or Options.target == 'wasm': defines += ' UNUSUAL_ALLOCATOR_DECLARATION'  # libc++ (mac + emscripten): the std::allocator fwd-decl in vector{0,1,L}.fwd.hh is ambiguous vs libc++'s versioned namespace
     if Options.type in 'Release MinSizeRel': defines += ' NDEBUG BCL_NO_OS_SIGNAL_HANDLING'
     if Options.serialization: defines += ' SERIALIZATION'
     if Options.multi_threaded: defines += ' MULTI_THREADED'
@@ -92,6 +92,29 @@ def get_defines():
     if Options.tensorflow: defines += ' USE_TENSORFLOW USE_TENSORFLOW_CPU'
     #if Options.hdf5: defines += ' USEHDF5'
     return defines.split()
+
+
+def get_emscripten_binder_includes():
+    ''' Clang args so Binder parses Rosetta against emscripten's libc++/musl
+    sysroot rather than the host libstdc++, matching the standard library em++
+    later compiles the generated bindings against. Without this, Binder emits
+    std:: bindings tied to libstdc++ internals (bits/*.h, std::type_info::
+    __is_pointer_p, std::_Ios_Fmtflags) that do not exist under libc++.
+
+    Search dirs are read back from em++ itself (on PATH because build-wasm.py
+    sources emsdk_env.sh before invoking build.py). em++'s own clang builtin
+    headers are dropped: em++ is clang 21 but Binder is LLVM 19, so Binder
+    keeps its version-matched resource dir; only libc++, musl, and the
+    emscripten shim dirs are borrowed. The wasm32 target triple is forced so
+    libc++ configures its ABI macros and pointer width as for the real build. '''
+    probe = subprocess.run(['em++', '-x', 'c++', '-std=c++11', '-E', '-v', '-'],
+                           input='', capture_output=True, text=True, check=True)
+    dirs, capture = [], False
+    for line in probe.stderr.splitlines():
+        if '#include <...> search starts here:' in line: capture = True; continue
+        if 'End of search list' in line: break
+        if capture and '/lib/clang/' not in line: dirs.append(line.strip())
+    return ' -target wasm32-unknown-emscripten' + ''.join(' -isystem ' + d for d in dirs)
 
 
 def execute(message, command_line, return_='status', until_successes=False, terminate_on_failure=True, silent=False, silence_output=False):
@@ -796,6 +819,7 @@ def generate_bindings(rosetta_source_path):
     signature_update(config)
 
     includes = ''.join( [' -isystem '+i for i in get_rosetta_system_include_directories()] ) + ''.join( [' -I'+i for i in get_rosetta_include_directories()] )
+    if Options.target == 'wasm': includes = get_emscripten_binder_includes() + includes
     defines  = ''.join( [' -D'+d for d in get_defines()] ) + ' -DPYROSETTA_BINDER'
 
     if Platform == 'macos':
