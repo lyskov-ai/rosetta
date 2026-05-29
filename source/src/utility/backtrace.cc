@@ -20,7 +20,7 @@
 #include <iostream>
 #include <sstream>
 
-#if defined(__GNUC__)  &&  !defined(WIN32)  &&  !defined(__CYGWIN__) && MY__has_include( <cxxabi.h> ) && !defined(ANDROID)
+#if defined(__GNUC__)  &&  !defined(WIN32)  &&  !defined(__CYGWIN__) && MY__has_include( <cxxabi.h> ) && MY__has_include( <execinfo.h> ) && !defined(ANDROID)
 
 #include <execinfo.h>
 #include <cxxabi.h>
@@ -74,7 +74,7 @@ handle_assert_failure( char const * condition, std::string const & file, int con
 }
 
 
-#if defined(__GNUC__)  &&  !defined(WIN32)  &&  !defined(__CYGWIN__) && MY__has_include( <cxxabi.h> ) && !defined(ANDROID)
+#if defined(__GNUC__)  &&  !defined(WIN32)  &&  !defined(__CYGWIN__) && MY__has_include( <cxxabi.h> ) && MY__has_include( <execinfo.h> ) && !defined(ANDROID)
 
 bool
 print_backtrace( char const * /*unused*/ ) {
