@@ -305,7 +305,10 @@
 ###########################
 [submodule "source/src/python/PyRosetta/binder"]
 	path = source/src/python/PyRosetta/binder
-	url = ../../RosettaCommons/binder.git
+	# Points one level up rather than at RosettaCommons so it follows this fork: the binder
+	# commit recorded here is not upstream yet. Restore ../../RosettaCommons/binder.git once
+	# the fix-field-assignable-type-sugar PR has merged.
+	url = ../binder.git
 [submodule "source/external/pybind11"]
 	path = source/external/pybind11
 	url = ../../RosettaCommons/pybind11.git

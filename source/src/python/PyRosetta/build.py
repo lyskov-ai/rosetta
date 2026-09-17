@@ -846,6 +846,11 @@ def generate_bindings(rosetta_source_path):
     binder_command_line_options = f'--config {config} --root-module rosetta --prefix {prefix}{annotate}{trace} {include} -- -std={cpp_standard} {includes} {defines}'
     signature_update(binder_command_line_options)
 
+    # Binder itself has to be part of the signature: a rebuilt or upgraded Binder generates different
+    # bindings from unchanged headers, and without this the run below is skipped and the previous
+    # generation silently kept.
+    signature_update( str( os.path.getmtime(Options.binder) ) )
+
     signature = signature.hexdigest()
     if signature != disk_signature:
         execute('Generating bindings...', 'cd {prefix} && {binder} {binder_command_line_options}'.format(prefix=prefix, binder=Options.binder, binder_command_line_options=binder_command_line_options) )

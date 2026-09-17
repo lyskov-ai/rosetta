@@ -461,14 +461,17 @@ def ensure_libpython_stub(prefix_root: Path, py_minor: str) -> Path:
     return stub
 
 
-def ensure_zlib_stub(prefix_root: Path) -> tuple[Path, Path]:
+def ensure_zlib_stub(prefix_root: Path, emsdk_env: Path) -> tuple[Path, Path]:
     """Provide a zlib include dir + library stub for CMake's
     ``find_package(ZLIB REQUIRED)`` call in rosetta.cmake. Emscripten's
     SIDE_MODULE wheels resolve zlib symbols against the Pyodide runtime
-    at import time, so the library file is unused at link time — but
-    cmake still demands a real path. Headers come from the host
-    (``/usr/include/zlib.h`` + ``zconf.h``); the library is an empty
-    stub. Returns ``(include_dir, library_file)``."""
+    at import time, so the library needs to contribute no symbols — but
+    cmake still demands a real path and puts it on the link line, where
+    wasm-ld rejects anything that is not a wasm file, an empty file
+    included. So the stub is an object compiled from an empty
+    translation unit rather than an empty file. Headers come from the
+    host (``/usr/include/zlib.h`` + ``zconf.h``). Returns
+    ``(include_dir, library_file)``."""
     stub_dir = prefix_root / "wasm-stubs" / "zlib"
     include_dir = stub_dir / "include"
     library_file = stub_dir / "libz.so"
@@ -483,8 +486,14 @@ def ensure_zlib_stub(prefix_root: Path) -> tuple[Path, Path]:
                     f"`zlib1g-dev` (or equivalent) and re-run."
                 )
             shutil.copy2(host_header, target)
-    if not library_file.exists():
-        library_file.touch()
+    if not library_file.is_file() or library_file.stat().st_size == 0:
+        empty_tu = stub_dir / "empty.c"
+        empty_tu.touch()
+        execute_shell(
+            "Compiling zlib link stub",
+            f"source {shlex.quote(str(emsdk_env))} >/dev/null && "
+            f"emcc -c {shlex.quote(str(empty_tu))} -o {shlex.quote(str(library_file))}",
+        )
     return include_dir, library_file
 
 
@@ -510,7 +519,7 @@ def run_build_phase(
 
     py_minor = ".".join(config["python_version"].split(".")[:2])
     python_lib_stub = ensure_libpython_stub(prefix_root, py_minor)
-    zlib_include_dir, zlib_library = ensure_zlib_stub(prefix_root)
+    zlib_include_dir, zlib_library = ensure_zlib_stub(prefix_root, emsdk_env)
 
     # Rosetta-WASM-specific C++ defines layered on top of Pyodide's cxxflags.
     # -DUNUSUAL_ALLOCATOR_DECLARATION: swap the `namespace std { template<typename>
