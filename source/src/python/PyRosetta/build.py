@@ -743,6 +743,11 @@ def run_cmake(rosetta_source_path):
         if Options.zlib_include_dir: wasm_extras += ' -DZLIB_INCLUDE_DIR=' + Options.zlib_include_dir
         if Options.zlib_library:     wasm_extras += ' -DZLIB_LIBRARY=' + Options.zlib_library
 
+        # rosetta.cmake's post-build step runs the host `strip`, which does not recognise a wasm
+        # module. Emscripten has already minimised it (-g0, -Oz), and llvm-strip would drop the
+        # custom sections -- dylink.0 among them -- that loading a side module depends on.
+        wasm_extras += ' -DPYROSETTA_STRIP_MODULE=OFF'
+
     execute('Running CMake...', 'cd {prefix} && cmake -G Ninja {} -DPYROSETTA_PYTHON_VERSION={python_version}{py_lib}{py_include}{gcc_install_prefix}{wasm_extras} ../source'.format(config, prefix=prefix, python_version=python_version,
                                                                                                                                                                         py_lib=' -DPYTHON_LIBRARY='+Options.python_lib if Options.python_lib else '',
                                                                                                                                                                         py_include=' -DPYTHON_INCLUDE_DIR='+Options.python_include_dir if Options.python_include_dir else '',
