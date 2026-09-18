@@ -227,10 +227,19 @@ elseif (UNIX)
   # module is over that on its own. Split it here; the script errors out if a
   # function is over the limit and cannot be split, so the build stops rather
   # than producing a module that cannot be loaded.
+  # VERBATIM: without it CMake passes these paths to the build tool unescaped,
+  # and ninja hands the command to /bin/sh, so a backtick in the interpreter or
+  # script path would be substituted rather than passed through.
   if(PYROSETTA_WASM_SPLIT_SCRIPT)
     add_custom_command(TARGET rosetta POST_BUILD
-      COMMAND "${PYROSETTA_WASM_PYTHON}" "${PYROSETTA_WASM_SPLIT_SCRIPT}" ${PROJECT_BINARY_DIR}/pyrosetta/rosetta.so
-      COMMENT "Splitting over-sized functions in rosetta.so")
+      COMMAND "${PYROSETTA_WASM_PYTHON}" "${PYROSETTA_WASM_SPLIT_SCRIPT}" "${PROJECT_BINARY_DIR}/pyrosetta/rosetta.so"
+      COMMENT "Splitting over-sized functions in rosetta.so"
+      VERBATIM)
+    # A POST_BUILD command cannot declare DEPENDS, so it re-runs only when the
+    # link does. Make the link itself depend on the script: editing it would
+    # otherwise leave the previously split module in place, unchanged and
+    # unchecked.
+    set_property(TARGET rosetta APPEND PROPERTY LINK_DEPENDS "${PYROSETTA_WASM_SPLIT_SCRIPT}")
   endif()
 
 endif()

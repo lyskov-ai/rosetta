@@ -18,7 +18,10 @@ the suite runs anywhere Python does.  They mimic what ``wasm-ld`` emits for
 Run with:  python3 test_wasm_split_functions.py
 """
 
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -45,17 +48,36 @@ def relocation_group(offset: int) -> bytes:
 
 def build_module(code: bytes, locals_declaration: bytes = b"\x00",
                  params: int = 0, results: int = 0) -> bytes:
-    """A module with two globals and one function holding ``code``."""
+    """A module with one memory, two globals, and one function holding ``code``.
+
+    The memory is there so the stores validate: a wasm engine has to accept
+    this module for the engine-backed test below to mean anything.
+    """
     func_type = (b"\x60"
                  + splitter.write_uleb(params) + b"\x7f" * params
                  + splitter.write_uleb(results) + b"\x7f" * results)
     types = section(1, splitter.write_uleb(1) + func_type)
     functions = section(3, splitter.write_uleb(1) + splitter.write_uleb(0))
+    memory = section(5, splitter.write_uleb(1) + b"\x00\x01")      # 1 page, no maximum
     globals_ = section(6, splitter.write_uleb(2) + (b"\x7f\x00\x41\x00\x0b") * 2)
     body = locals_declaration + code + b"\x0b"
     code_section = section(10, splitter.write_uleb(1)
                            + splitter.write_uleb(len(body)) + body)
-    return b"\0asm\x01\x00\x00\x00" + types + functions + globals_ + code_section
+    return (b"\0asm\x01\x00\x00\x00" + types + functions + memory + globals_
+            + code_section)
+
+
+def find_wasm_engine() -> str | None:
+    """Node, for the one test that checks an engine accepts the output."""
+    found = shutil.which("node")
+    if found:
+        return found
+    bundled = sorted((Path(__file__).resolve().parents[4]
+                      / "build" / "PyRosetta-WASM" / "prefix").glob("emsdk-*/node/*/bin/node"))
+    return str(bundled[-1]) if bundled else None
+
+
+WASM_ENGINE = find_wasm_engine()
 
 
 def function_bodies(module: bytes) -> list[bytes]:
@@ -186,6 +208,111 @@ class RefusesWhatItCannotSplit(unittest.TestCase):
             splitter.split_module(build_module(code), limit=500, chunk_size=5)
 
         self.assertIn("no split point within", str(caught.exception))
+
+
+class UsesTheWholeEngineLimit(unittest.TestCase):
+    """Cut points can be far apart. A chunk budget below the engine limit would
+    refuse gaps the engine would have accepted, and there is no way to widen it
+    from the build."""
+
+    def setUp(self):
+        # Each block writes local 0, runs 25 stores while it is live -- so no
+        # cut is safe inside -- then reads it. The only cut points are the
+        # block boundaries, 264 bytes apart.
+        block = (b"\x41\x00\x21\x00"                                    # i32.const 0; local.set 0
+                 + relocation_group(4) * 25
+                 + b"\x23\x00\x41\x04\x6a\x20\x00\x36\x02\x00")         # ...local.get 0; i32.store
+        self.module = build_module(block * 3, locals_declaration=b"\x01\x01\x7f")
+
+    def test_a_gap_wider_than_a_fixed_budget_still_splits(self):
+        new_module, log = splitter.split_module(self.module, limit=700)
+
+        self.assertEqual(log, ["#0: 796 bytes -> 2 chunks"])
+        for body in function_bodies(new_module):
+            self.assertLessEqual(len(body), 700)
+
+    def test_an_explicit_chunk_size_narrower_than_the_gap_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            splitter.split_module(self.module, limit=700, chunk_size=200)
+
+        self.assertIn("no split point within 200 bytes", str(caught.exception))
+
+
+@unittest.skipUnless(WASM_ENGINE, "no wasm engine found")
+class OutputIsAcceptedByAWasmEngine(unittest.TestCase):
+    """The splitter's own parser reading back what it wrote proves nothing about
+    section framing or index spaces. An engine validating it does."""
+
+    def compile_in_engine(self, module: bytes) -> subprocess.CompletedProcess:
+        with tempfile.NamedTemporaryFile(suffix=".wasm") as handle:
+            handle.write(module)
+            handle.flush()
+            return subprocess.run(
+                [WASM_ENGINE, "-e",
+                 'new WebAssembly.Module(require("fs").readFileSync(process.argv[1]));'
+                 'console.log("valid")',
+                 handle.name],
+                capture_output=True, text=True)
+
+    def test_the_fixture_itself_is_a_valid_module(self):
+        result = self.compile_in_engine(build_module(relocation_group(4) * 300))
+
+        self.assertEqual(result.stdout.strip(), "valid", result.stderr)
+
+    def test_split_output_is_a_valid_module(self):
+        module, _log = splitter.split_module(build_module(relocation_group(4) * 300),
+                                             limit=500, chunk_size=100)
+
+        result = self.compile_in_engine(module)
+
+        self.assertEqual(result.stdout.strip(), "valid", result.stderr)
+
+
+class RejectsMalformedModules(unittest.TestCase):
+    """A corrupt module must fail loudly: the rewrite emits function indices, so
+    a misparse would produce a structurally valid module that calls the wrong
+    bodies."""
+
+    def test_truncated_section_is_reported(self):
+        module = build_module(relocation_group(4) * 4)
+
+        with self.assertRaises(ValueError) as caught:
+            splitter.parse_sections(module[:-5])
+
+        self.assertIn("truncated", str(caught.exception))
+
+    def test_global_import_with_an_unhandled_valtype_is_reported(self):
+        # One imported global whose valtype is a typed reference (0x63), which
+        # is more than one byte.
+        imports = (splitter.write_uleb(1)
+                   + splitter.write_uleb(3) + b"env"
+                   + splitter.write_uleb(1) + b"g"
+                   + b"\x03\x63\x00\x00")
+        module = build_module(relocation_group(4) * 4)
+        head = module[:8]
+        rest = module[8:]
+        with_import = head + section(2, imports) + rest
+
+        with self.assertRaises(ValueError) as caught:
+            splitter.split_module(with_import, limit=500, chunk_size=100)
+
+        self.assertIn("unhandled global valtype", str(caught.exception))
+
+    def test_over_long_leb128_is_reported(self):
+        with self.assertRaises(ValueError) as caught:
+            splitter.read_uleb(b"\xff" * 16, 0)
+
+        self.assertIn("longer than 64 bits", str(caught.exception))
+
+    def test_call_sequence_that_would_itself_exceed_the_limit_is_reported(self):
+        # Tiny chunks mean many chunks, and enough `call` instructions stop
+        # fitting in the function they replace.
+        module = build_module(relocation_group(4) * 300)
+
+        with self.assertRaises(ValueError) as caught:
+            splitter.split_module(module, limit=60, chunk_size=10)
+
+        self.assertIn("whose call sequence is 777 bytes", str(caught.exception))
 
 
 class DecodesRelocationCode(unittest.TestCase):

@@ -51,29 +51,39 @@ from pathlib import Path
 # JavaScriptCore are more permissive, so this is the binding constraint.
 V8_MAX_FUNCTION_SIZE = 7_654_321
 
-# Chunks are built well under the cap: the accounting below is over the
-# instruction bytes, and a chunk also carries the function's locals
-# declaration and its own `end`.
-DEFAULT_CHUNK_SIZE = 6_000_000
+# A chunk's budget is measured in instruction bytes, but the body it goes into
+# also carries the function's locals declaration, its own `end`, and a size
+# prefix of at most five bytes. Subtracting that from the engine limit is what
+# makes the budget exact: cut points can be far apart, and every byte of slack
+# left here is a gap the splitter would refuse to cross even though the engine
+# would have accepted the chunk.
+CHUNK_FRAMING_BYTES = 6
 
 
 # ---------------------------------------------------------------------------
 # LEB128 primitives.
 # ---------------------------------------------------------------------------
+# Nothing in the format is wider than 64 bits, so a longer run of continuation
+# bytes is a corrupt file rather than a large number -- and decoding it anyway
+# would build an unbounded integer, which costs quadratic time.
+MAX_LEB_BYTES = 10
+
+
 def read_uleb(data: bytes, pos: int) -> tuple[int, int]:
     result = shift = 0
-    while True:
+    for _ in range(MAX_LEB_BYTES):
         byte = data[pos]
         pos += 1
         result |= (byte & 0x7F) << shift
         if not byte & 0x80:
             return result, pos
         shift += 7
+    raise ValueError(f"LEB128 value at {pos - MAX_LEB_BYTES} is longer than 64 bits")
 
 
 def read_sleb(data: bytes, pos: int) -> tuple[int, int]:
     result = shift = 0
-    while True:
+    for _ in range(MAX_LEB_BYTES):
         byte = data[pos]
         pos += 1
         result |= (byte & 0x7F) << shift
@@ -82,6 +92,7 @@ def read_sleb(data: bytes, pos: int) -> tuple[int, int]:
             if byte & 0x40:
                 result -= 1 << shift
             return result, pos
+    raise ValueError(f"LEB128 value at {pos - MAX_LEB_BYTES} is longer than 64 bits")
 
 
 def write_uleb(value: int) -> bytes:
@@ -99,6 +110,11 @@ def write_uleb(value: int) -> bytes:
 # ---------------------------------------------------------------------------
 # Module structure.
 # ---------------------------------------------------------------------------
+# i32, i64, f32, f64, v128, funcref, externref -- the valtypes that encode as a
+# single byte.
+ONE_BYTE_VALTYPES = frozenset({0x7F, 0x7E, 0x7D, 0x7C, 0x7B, 0x70, 0x6F})
+
+
 @dataclass
 class Section:
     """One top-level section: ``payload`` excludes the id and size prefix."""
@@ -120,6 +136,10 @@ def parse_sections(data: bytes) -> list[Section]:
         section_id = data[pos]
         pos += 1
         size, pos = read_uleb(data, pos)
+        if pos + size > len(data):
+            raise ValueError(
+                f"section {section_id} claims {size:,} bytes but only "
+                f"{len(data) - pos:,} remain: the module is truncated")
         sections.append(Section(section_id, pos, pos + size))
         pos += size
     return sections
@@ -151,6 +171,11 @@ def count_imported_functions(data: bytes, section: Section) -> int:
             if limits & 0x01:
                 _max, pos = read_uleb(data, pos)
         elif kind == 0x03:  # global
+            # A typed-reference valtype is more than one byte, and miscounting
+            # here would shift every function index the rewrite emits -- a
+            # silently wrong module rather than a failure. Refuse instead.
+            if data[pos] not in ONE_BYTE_VALTYPES:
+                raise ValueError(f"unhandled global valtype {data[pos]:#x} in the import section")
             pos += 2  # valtype, mutability
         elif kind == 0x04:  # tag
             pos += 1  # attribute
@@ -180,11 +205,26 @@ def parse_type_signatures(data: bytes, section: Section) -> list[tuple[int, int]
         if form != 0x60:
             raise ValueError(f"unsupported type form {form:#x} (not a function type)")
         params, pos = read_uleb(data, pos)
-        pos += params
+        pos = skip_valtypes(data, pos, params)
         results, pos = read_uleb(data, pos)
-        pos += results
+        pos = skip_valtypes(data, pos, results)
         signatures.append((params, results))
     return signatures
+
+
+def skip_valtypes(data: bytes, pos: int, count: int) -> int:
+    """Step over ``count`` value types, refusing any that is not one byte.
+
+    Miscounting here desynchronises the type scan, which would give later
+    functions the wrong arity, put the decoder's operand-stack depth out of
+    step, and let a cut land mid-expression -- a module that is wrong rather
+    than one that fails to build.
+    """
+    for _ in range(count):
+        if data[pos] not in ONE_BYTE_VALTYPES:
+            raise ValueError(f"unhandled valtype {data[pos]:#x} in the type section")
+        pos += 1
+    return pos
 
 
 def parse_code_bodies(data: bytes, section: Section) -> list[tuple[int, int]]:
@@ -213,6 +253,8 @@ def parse_function_names(data: bytes, section: Section) -> dict[int, str]:
         if subsection == 1:  # function names
             count, cursor = read_uleb(data, pos)
             for _ in range(count):
+                if cursor >= end:
+                    raise ValueError("name section declares more names than it holds")
                 index, cursor = read_uleb(data, cursor)
                 length, cursor = read_uleb(data, cursor)
                 names[index] = data[cursor:cursor + length].decode("utf8", "replace")
@@ -407,8 +449,13 @@ def build_body(locals_declaration: bytes, code: bytes) -> bytes:
     return write_uleb(len(payload)) + payload
 
 
-def split_module(data: bytes, limit: int, chunk_size: int) -> tuple[bytes, list[str]]:
-    """Split every over-sized function body.  Returns the new module and a log."""
+def split_module(data: bytes, limit: int,
+                 chunk_size: int | None = None) -> tuple[bytes, list[str]]:
+    """Split every over-sized function body.  Returns the new module and a log.
+
+    ``chunk_size`` caps the instruction bytes per chunk; left out, each chunk
+    takes as much as ``limit`` allows.
+    """
     sections = parse_sections(data)
     by_id = {}
     for section in sections:
@@ -459,7 +506,10 @@ def split_module(data: bytes, limit: int, chunk_size: int) -> tuple[bytes, list[
         try:
             locals_declaration, code_start = decode_locals(body)
             instructions = decode_body(body, code_start, call_arity)
-            ranges = plan_chunks(instructions, code_start, chunk_size)
+            budget = limit - len(locals_declaration) - CHUNK_FRAMING_BYTES
+            if chunk_size is not None:
+                budget = chunk_size
+            ranges = plan_chunks(instructions, code_start, budget)
         except UnsplittableBody as error:
             raise ValueError(
                 f"function {name} is {end - start:,} bytes, over the "
@@ -475,7 +525,12 @@ def split_module(data: bytes, limit: int, chunk_size: int) -> tuple[bytes, list[
             new_types.append(type_index)
             calls += bytes([CALL_OPCODE]) + write_uleb(next_index)
             next_index += 1
-        replacements[body_index] = build_body(locals_declaration, bytes(calls))
+        trampoline = build_body(locals_declaration, bytes(calls))
+        if len(trampoline) > limit:
+            raise ValueError(
+                f"{name} needs {len(ranges):,} chunks, whose call sequence is "
+                f"{len(trampoline):,} bytes -- itself over the limit; raise --chunk-size")
+        replacements[body_index] = trampoline
         log.append(f"{name}: {end - start:,} bytes -> {len(ranges)} chunks")
 
     # Code section: bodies in place, with the over-sized ones replaced, then
@@ -541,8 +596,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("module", type=Path, help="wasm module to rewrite in place")
     parser.add_argument("--limit", type=int, default=V8_MAX_FUNCTION_SIZE,
                         help="maximum function body size the engine accepts")
-    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
-                        help="target instruction bytes per chunk function")
+    parser.add_argument("--chunk-size", type=int, default=None,
+                        help="cap the instruction bytes per chunk function "
+                             "(default: as much as --limit allows)")
     parser.add_argument("--check", action="store_true",
                         help="report over-sized functions without rewriting")
     args = parser.parse_args(argv)
