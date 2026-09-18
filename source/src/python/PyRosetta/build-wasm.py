@@ -529,6 +529,24 @@ def run_build_phase(
     rosetta_cxx_defines = "-DUNUSUAL_ALLOCATOR_DECLARATION"
     cxxflags = config["cxxflags"] + " " + rosetta_cxx_defines
 
+    # Pyodide's ldflags end in -Oz, which drives emcc's post-link `wasm-opt`
+    # pass. On a module this size that pass is both ruinous and disqualifying:
+    #
+    #  - it inlines every single-caller function without a size bound
+    #    (binaryen's --one-caller-inline-max-function-size defaults to "all"),
+    #    which fuses the per-translation-unit binding functions into one
+    #    22 MB function -- past the 7,654,321-byte cap every wasm engine puts
+    #    on a single function body, so the module will not even compile;
+    #  - it hoists repeated values in __wasm_apply_data_relocs into locals that
+    #    stay live across the whole body, which leaves wasm_split_functions.py
+    #    nowhere safe to cut that function (it is over the cap on its own);
+    #  - it took 13.75 h at ~39 GB RSS on the last full link.
+    #
+    # emcc takes the last -O it is given, so appending -O1 overrides it. That
+    # keeps the linker's own output shape, which is splittable, at the cost of
+    # the size reduction -Oz would have given.
+    ldflags = config["ldflags"] + " -O1"
+
     inner_args = [
         "build.py",
         "--target", "wasm",
@@ -537,7 +555,7 @@ def run_build_phase(
         "--python-lib", str(python_lib_stub),
         "--cflags", config["cflags"],
         "--cxxflags", cxxflags,
-        "--ldflags", config["ldflags"],
+        "--ldflags", ldflags,
         "--python-version", py_minor,
         "--zlib-include-dir", str(zlib_include_dir),
         "--zlib-library", str(zlib_library),

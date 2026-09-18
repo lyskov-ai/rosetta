@@ -748,6 +748,14 @@ def run_cmake(rosetta_source_path):
         # custom sections -- dylink.0 among them -- that loading a side module depends on.
         wasm_extras += ' -DPYROSETTA_STRIP_MODULE=OFF'
 
+        # wasm-ld synthesises __wasm_apply_data_relocs with one store per pointer in the
+        # module's data, which for rosetta.so lands well past the 7,654,321-byte cap wasm
+        # engines put on a single function body. Split it after the link; the script also
+        # fails the build if any function is over the cap and cannot be split.
+        splitter = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wasm_split_functions.py')
+        wasm_extras += ' -DPYROSETTA_WASM_PYTHON=' + shlex.quote(sys.executable)
+        wasm_extras += ' -DPYROSETTA_WASM_SPLIT_SCRIPT=' + shlex.quote(splitter)
+
     execute('Running CMake...', 'cd {prefix} && cmake -G Ninja {} -DPYROSETTA_PYTHON_VERSION={python_version}{py_lib}{py_include}{gcc_install_prefix}{wasm_extras} ../source'.format(config, prefix=prefix, python_version=python_version,
                                                                                                                                                                         py_lib=' -DPYTHON_LIBRARY='+Options.python_lib if Options.python_lib else '',
                                                                                                                                                                         py_include=' -DPYTHON_INCLUDE_DIR='+Options.python_include_dir if Options.python_include_dir else '',
