@@ -240,6 +240,50 @@ elseif (UNIX)
     # otherwise leave the previously split module in place, unchanged and
     # unchecked.
     set_property(TARGET rosetta APPEND PROPERTY LINK_DEPENDS "${PYROSETTA_WASM_SPLIT_SCRIPT}")
+
+    # wasm-ld emits a markedly larger encoding than binaryen's, and emcc runs no
+    # wasm-opt pass at the -O1 the WASM link uses, so the module reaches here
+    # unoptimised. This pass is what makes it a reasonable size to ship.
+    #
+    # It runs *after* the split above, and the order is the whole point. Optimising
+    # first leaves __wasm_apply_data_relocs both over the cap and unsplittable: the
+    # optimiser hoists repeated values into locals that stay live across the entire
+    # body, so no cut point has an empty operand stack and no live locals. Splitting
+    # first means the optimiser only ever sees chunks already under the cap.
+    #
+    # --one-caller-inline-max-function-size bounds single-caller inlining, which
+    # binaryen leaves unbounded by default. Unbounded, it fuses the per-translation-
+    # unit binding functions into one body far over the cap, and inlines the chunk
+    # functions straight back into the function they were just cut out of.
+    #
+    # The second split is the backstop: bounded inlining still grows functions, so
+    # anything that crossed the cap is cut again -- and the script fails the build if
+    # it cannot be, rather than leaving a module that will not load.
+    #
+    # Both steps work on a temporary, which is renamed over rosetta.so only once that
+    # split has passed on it. Order matters here too: renaming first would mean a
+    # failed backstop leaves an optimised-but-unsplit rosetta.so on disk, and
+    # `build-wasm.py --skip-build-phase` would package it into a wheel that installs
+    # cleanly and fails at `import pyrosetta`. As written, a failure anywhere leaves
+    # the split module the link produced, which loads.
+    if(PYROSETTA_WASM_OPT)
+      # Checked here because the alternative is discovering it after the link.
+      if(NOT EXISTS "${PYROSETTA_WASM_OPT}")
+        message(FATAL_ERROR "PYROSETTA_WASM_OPT is set to \"${PYROSETTA_WASM_OPT}\", which does not exist.")
+      endif()
+      add_custom_command(TARGET rosetta POST_BUILD
+        COMMAND "${PYROSETTA_WASM_OPT}"
+                "${PROJECT_BINARY_DIR}/pyrosetta/rosetta.so"
+                -o "${PROJECT_BINARY_DIR}/pyrosetta/rosetta.so.opt"
+                -Oz --one-caller-inline-max-function-size=2000
+        COMMAND "${PYROSETTA_WASM_PYTHON}" "${PYROSETTA_WASM_SPLIT_SCRIPT}" "${PROJECT_BINARY_DIR}/pyrosetta/rosetta.so.opt"
+        COMMAND "${CMAKE_COMMAND}" -E rename
+                "${PROJECT_BINARY_DIR}/pyrosetta/rosetta.so.opt"
+                "${PROJECT_BINARY_DIR}/pyrosetta/rosetta.so"
+        BYPRODUCTS "${PROJECT_BINARY_DIR}/pyrosetta/rosetta.so.opt"
+        COMMENT "Optimising rosetta.so for size"
+        VERBATIM)
+    endif()
   endif()
 
 endif()

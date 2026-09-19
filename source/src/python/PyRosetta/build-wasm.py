@@ -310,6 +310,17 @@ def install_emsdk(prefix_root: Path, version: str = EMSDK_VERSION) -> Path:
     return env_script
 
 
+def emsdk_wasm_opt(emsdk_env: Path) -> Path:
+    """Path to binaryen's ``wasm-opt`` inside an installed emsdk.
+
+    The post-link size pass runs from CMake, which has no sourced emsdk env
+    and so cannot find it on PATH; pass the absolute path instead."""
+    wasm_opt = emsdk_env.parent / "upstream" / "bin" / "wasm-opt"
+    if not wasm_opt.is_file():
+        sys.exit(f"wasm-opt is missing from the emsdk install at {wasm_opt}")
+    return wasm_opt
+
+
 def install_pyodide_build_env(
     prefix_root: Path,
     pyodide_version: str = PYODIDE_VERSION,
@@ -549,11 +560,18 @@ def run_build_phase(
     #  - it hoists repeated values in __wasm_apply_data_relocs into locals that
     #    stay live across the whole body, which leaves wasm_split_functions.py
     #    nowhere safe to cut that function (it is over the cap on its own);
-    #  - it took 13.75 h at ~39 GB RSS on the last full link.
+    #  - it took 13.75 h at ~39 GB RSS on the last full link, almost all of it
+    #    spent optimising the fused body the first bullet describes.
     #
-    # emcc takes the last -O it is given, so appending -O1 overrides it. That
-    # keeps the linker's own output shape, which is splittable, at the cost of
-    # the size reduction -Oz would have given.
+    # emcc takes the last -O it is given, so appending -O1 overrides it. That keeps
+    # the linker's own output shape, which is splittable. The size is not given up:
+    # rosetta.cmake runs wasm-opt after the split instead.
+    #
+    # Bounding the inlining is not on its own enough to make the link-time pass
+    # usable, even though -sBINARYEN_EXTRA_PASSES would carry the option through
+    # (emscripten forwards a '-'-prefixed entry verbatim). The ordering is what
+    # rules it out: emcc's pass runs during the link, so it would see
+    # __wasm_apply_data_relocs whole and over the cap, and leave it unsplittable.
     ldflags = config["ldflags"] + " -O1"
 
     inner_args = [
@@ -568,6 +586,7 @@ def run_build_phase(
         "--python-version", py_minor,
         "--zlib-include-dir", str(zlib_include_dir),
         "--zlib-library", str(zlib_library),
+        "--wasm-opt", str(emsdk_wasm_opt(emsdk_env)),
         "--type", args.type,
         "-j", str(args.jobs),
     ]

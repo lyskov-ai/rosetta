@@ -756,6 +756,9 @@ def run_cmake(rosetta_source_path):
         wasm_extras += ' -DPYROSETTA_WASM_PYTHON=' + shlex.quote(sys.executable)
         wasm_extras += ' -DPYROSETTA_WASM_SPLIT_SCRIPT=' + shlex.quote(splitter)
 
+        # Drives the post-link size pass; rosetta.cmake explains the ordering it needs.
+        if Options.wasm_opt: wasm_extras += ' -DPYROSETTA_WASM_OPT=' + shlex.quote(Options.wasm_opt)
+
     execute('Running CMake...', 'cd {prefix} && cmake -G Ninja {} -DPYROSETTA_PYTHON_VERSION={python_version}{py_lib}{py_include}{gcc_install_prefix}{wasm_extras} ../source'.format(config, prefix=prefix, python_version=python_version,
                                                                                                                                                                         py_lib=' -DPYTHON_LIBRARY='+Options.python_lib if Options.python_lib else '',
                                                                                                                                                                         py_include=' -DPYTHON_INCLUDE_DIR='+Options.python_include_dir if Options.python_include_dir else '',
@@ -1058,6 +1061,7 @@ def main(args):
     parser.add_argument('--ldflags', default=None, help='Extra linker flags (forwarded as -DCMAKE_EXE_LINKER_FLAGS=... and -DCMAKE_SHARED_LINKER_FLAGS=...). --target wasm only.')
     parser.add_argument('--zlib-include-dir', default=None, help='Path to zlib headers (forwarded as -DZLIB_INCLUDE_DIR=...). --target wasm only.')
     parser.add_argument('--zlib-library', default=None, help='Path to libz file (forwarded as -DZLIB_LIBRARY=...). --target wasm only.')
+    parser.add_argument('--wasm-opt', default=None, help="Path to binaryen's wasm-opt (forwarded as -DPYROSETTA_WASM_OPT=...), used for the post-link size pass. --target wasm only.")
 
     parser.add_argument('--gcc-install-prefix', default=None, help='Path to GCC install prefix which will be used to determent location of libstdc++ for Binder build. Default is: auto-detected. Use this option if you would like to build Binder with compiler that was side-installed and which LLVM build system failed to identify. To see what path Binder uses for libstdc++ run `binder -- -xc++ -E -v`.')
 
@@ -1091,7 +1095,7 @@ def main(args):
             print('NOTE: --target wasm overrides --zmq default; building without ZeroMQ.')
         Options.zmq = False
     else:
-        for name in ('cmake_toolchain', 'cflags', 'cxxflags', 'ldflags', 'zlib_include_dir', 'zlib_library'):
+        for name in ('cmake_toolchain', 'cflags', 'cxxflags', 'ldflags', 'zlib_include_dir', 'zlib_library', 'wasm_opt'):
             if getattr(Options, name) is not None:
                 sys.exit('ERROR: --{} is only valid with --target wasm'.format(name.replace('_', '-')))
 
