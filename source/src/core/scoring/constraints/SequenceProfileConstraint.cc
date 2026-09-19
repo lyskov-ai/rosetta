@@ -35,8 +35,6 @@
 #include <core/scoring/func/XYZ_Func.hh>
 #include <utility/vector1.hh>
 
-#include <boost/lexical_cast.hpp>
-
 
 #ifdef SERIALIZATION
 // Utility serialization headers
@@ -154,18 +152,24 @@ SequenceProfileConstraint::read_def(
 		seqpos_ = residue_index;
 		const_cast<SequenceProfile * >(sequence_profile_.get())->prof_row( aa_scores, residue_index );
 	} else {
-		auto residue_index(boost::lexical_cast<Size>(version));
+		// `version` is the residue index here. It used to be widened with
+		// boost::lexical_cast<Size>, whose boost::numeric conversion traits
+		// form mpl::integral_c<enum, 0>::prior -- -1 as an enumerator value --
+		// which Clang rejects outright, with no flag left to downgrade it.
+		// That cast validated nothing: it wrapped negatives into huge unsigned
+		// values that the upper-bound test below rejected anyway, so testing
+		// the signed value accepts the same inputs and reports them legibly.
 		std::string profile_filename;
 
 		is >> profile_filename;
 
-		TR(t_debug) << "reading: " << residue_index << " " << profile_filename << std::endl;
-		if ( residue_index < 1 || residue_index > pose.size() ) {
-			std::cerr << "no such residue index " << residue_index << " in pose!)" << std::endl;
+		TR(t_debug) << "reading: " << version << " " << profile_filename << std::endl;
+		if ( version < 1 || static_cast< Size >( version ) > pose.size() ) {
+			std::cerr << "no such residue index " << version << " in pose!)" << std::endl;
 			utility_exit();
 		}
 
-		seqpos_ = residue_index;
+		seqpos_ = static_cast< Size >( version );
 
 		// figure out sequence profile filename
 		using namespace utility::file;

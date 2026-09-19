@@ -5,8 +5,8 @@
 #
 # Loaded by build.py:generate_rosetta_cmake_files when
 # Options.target == 'wasm'. See task 0014.
-
-# boost::lexical_cast<Size>(version) at line 157 → boost::numeric MPL
-# chain → integral_c<…, -1>::prior fails strict-constexpr on
-# emscripten libc++.
-core/scoring/constraints/SequenceProfileConstraint.cc
+#
+# Currently empty. Excluding a TU only moves a compile error to load
+# time unless nothing else in the build references its symbols, and
+# anything reachable from core/init/init.cc is referenced. Prefer
+# making the TU compile.
