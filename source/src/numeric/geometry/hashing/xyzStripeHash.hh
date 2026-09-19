@@ -60,7 +60,9 @@ class xyzStripeHash : public utility::VirtualBase {
 	short ushort_max(unsigned short const a, unsigned short const b) { return (a > b) ? a : b; }
 public:
 	typedef unsigned short ushort;
-	typedef struct { unsigned short x,y; } ushort2;
+	// A named struct rather than a typedef'd anonymous one: Binder gives an
+	// anonymous struct an empty Python class name.
+	struct ushort2 { unsigned short x,y; };
 	typedef numeric::xyzVector<float> Vec;
 
 	// iterators:

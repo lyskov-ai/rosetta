@@ -33,10 +33,13 @@ class xyzStripeHashWithMeta : public utility::VirtualBase {
 
 public:
 	typedef std::pair<numeric::xyzVector<T>,T> VecandVal;
-	typedef struct { T x,y,z,w; } float4;
+	// Named structs rather than typedef'd anonymous ones: Binder gives an
+	// anonymous struct an empty Python class name, and two of those in one
+	// scope collide when pybind11 registers the second.
+	struct float4 { T x,y,z,w; };
 	//typedef unsigned int uint;
 	typedef unsigned short ushort;
-	typedef struct { unsigned short x,y; } ushort2;
+	struct ushort2 { unsigned short x,y; };
 	typedef numeric::xyzVector<T> Vec;
 
 	// iterators:
