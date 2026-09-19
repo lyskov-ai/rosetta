@@ -29,6 +29,9 @@ Pipeline:
 3. Phase 3 — package: invoke ``pyodide build`` against the resulting
    ``setup.py``. The wheel post-processor renames the ``.so`` to
    carry the Pyodide ABI tag. Skipped by ``--skip-pyodide-build-phase``.
+4. Phase 4 — test: install the wheel into a throwaway ``pyodide venv``
+   and assert that ``import pyrosetta; pyrosetta.init()`` prints the
+   M1 banner. Run only with ``--test``.
 
 Host prerequisites:
     - git, curl, bash
@@ -106,6 +109,12 @@ def build_root(build_type: str) -> Path:
         / f"python-{PYTHON_MINOR}"
         / config
     )
+
+
+def wheel_dist_dir(build_type: str) -> Path:
+    """Where ``pyodide build`` drops wheels. Written by the package phase
+    and read by the test phase, so both must agree on it."""
+    return build_root(build_type) / "dist"
 
 
 def pyodide_build_install_dir(prefix_root: Path) -> Path:
@@ -588,9 +597,13 @@ def run_pyodide_build_phase(
     emsdk_env: Path,
     args: argparse.Namespace,
     inner_build_root: Path,
-) -> Path:
+) -> Path | None:
     """Invoke ``pyodide build`` on ``<inner_build_root>/build/``. Returns
-    the outdir where wheels (if any) land."""
+    the wheel this run produced, or None if it did not produce exactly one.
+
+    Identifying the wheel here, rather than globbing ``dist/`` later, is
+    what stops a wheel left by an earlier run from standing in for one this
+    run failed to make."""
     setup_dir = inner_build_root / "build"
     setup_py = setup_dir / "setup.py"
     if not setup_py.is_file():
@@ -600,8 +613,12 @@ def run_pyodide_build_phase(
             f"changed; re-check the handoff path."
         )
 
-    outdir = build_root(args.type) / "dist"
+    outdir = wheel_dist_dir(args.type)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    # Wheels already in the outdir, so the ones this run writes can be told
+    # apart from leftovers. A rebuilt wheel keeps its name, hence the mtime.
+    before = {w: w.stat().st_mtime for w in outdir.glob("*.whl")}
 
     xbuildenv = xbuildenv_root_for(prefix_root)
     pyodide_bin = pyodide_venv_bin / "pyodide"
@@ -617,16 +634,161 @@ def run_pyodide_build_phase(
     )
     execute_shell("Running pyodide build", shell_cmd)
 
-    wheels = sorted(outdir.glob("*.whl"))
-    if wheels:
-        print()
-        print(f"Wheels produced under {outdir}:")
-        for w in wheels:
-            print(f"  {w.name}")
+    produced = [
+        w for w in sorted(outdir.glob("*.whl"))
+        if before.get(w) != w.stat().st_mtime
+    ]
+    print()
+    if len(produced) == 1:
+        print(f"Wheel produced under {outdir}:")
+        print(f"  {produced[0].name}")
+        return produced[0]
+    if not produced:
+        print(f"WARNING: pyodide build exited 0 but wrote no wheel in {outdir}")
     else:
-        print()
-        print(f"WARNING: pyodide build exited 0 but no wheel was found in {outdir}")
-    return outdir
+        print(f"WARNING: pyodide build wrote {len(produced)} wheels in {outdir}:")
+        for w in produced:
+            print(f"  {w.name}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Test phase — install the wheel into a Pyodide venv and run the smoke test.
+# ---------------------------------------------------------------------------
+# What `pyrosetta.init()` has to print for the M1 smoke test to pass. Only
+# text that is stable from build to build: version strings, random seeds and
+# database paths vary per run and are deliberately not asserted on. The two
+# borders are the banner emitted by `pyrosetta/__init__.py:version()`.
+SMOKE_TEST_REQUIRED_OUTPUT = (
+    "┌" + "─" * 79 + "┐",
+    "PyRosetta-4",
+    "└" + "─" * 79 + "┘",
+    "core.init:",
+    "basic.random.init_random_generator:",
+)
+
+# Run from a file rather than `python -c`, and the difference is not
+# cosmetic. `python -c` leaves `__main__` without a `__file__`, so
+# `pyrosetta._is_interactive()` is True, `init()` defaults to
+# `set_logging_handler="interactive"`, and `set_logging_sink()` calls
+# `Tracer.super_mute(True)`: the banner then reaches stdout only through
+# Python's `logging`, and the C++ tracer's own stdout — the path an
+# emscripten stdout fault would break, and the one a browser console shows
+# — is never exercised. From a file, `_is_interactive()` is False and
+# nothing is muted.
+SMOKE_TEST_SOURCE = "import pyrosetta\npyrosetta.init()\n"
+
+
+def find_wheel_to_test(wheel_dir: Path) -> Path:
+    """The single wheel in ``wheel_dir``, for the paths where the package
+    phase did not just hand one over."""
+    wheels = sorted(wheel_dir.glob("*.whl"))
+    if not wheels:
+        sys.exit(
+            f"No wheel to test in {wheel_dir}. Run without "
+            f"--skip-pyodide-build-phase to build one."
+        )
+    if len(wheels) > 1:
+        listed = "\n  ".join(w.name for w in wheels)
+        sys.exit(
+            f"Expected one wheel in {wheel_dir}, found {len(wheels)}:\n"
+            f"  {listed}\n"
+            f"Refusing to guess which one to test; remove the stale wheels."
+        )
+    return wheels[0]
+
+
+def run_test_phase(
+    prefix_root: Path,
+    pyodide_venv_bin: Path,
+    emsdk_env: Path,
+    args: argparse.Namespace,
+    wheel: Path,
+) -> None:
+    """Install the built wheel into a throwaway Pyodide venv and assert that
+    ``import pyrosetta; pyrosetta.init()`` prints the M1 banner.
+
+    The venv is rebuilt from scratch on every run, at the cost of
+    reinstalling a large wheel. Reusing one would not re-install: given a
+    wheel whose version is already present, pip skips it and still exits 0
+    ("pyrosetta is already installed with the same version as the provided
+    wheel"), so the test would silently pass against the previous build's
+    extension module.
+
+    Installing the wheel is also what keeps the test honest. The other
+    obvious route — mounting the inner build tree into the Pyodide
+    filesystem — silently tests nothing: its ``pyrosetta/__init__.py`` is a
+    relative symlink whose target is outside the mount root, so the mounted
+    ``pyrosetta`` has no ``__init__.py`` at all, imports as an empty
+    namespace package, and passes.
+    """
+    venv_dir = build_root(args.type) / "test-venv"
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir)
+
+    preamble = (
+        # emsdk_env.sh announces itself on stderr, which would otherwise land
+        # in the captured smoke-test output. EMSDK_QUIET is emsdk's own switch
+        # for that, and unlike a blanket 2>/dev/null it keeps real errors.
+        f"set -e && export EMSDK_QUIET=1 && "
+        f"source {shlex.quote(str(emsdk_env))} >/dev/null && "
+        # The Pyodide venv's `python` launcher picks its wasm runtime with
+        # `which node`, and emsdk_env.sh exports EMSDK_NODE without putting
+        # it on PATH. Without this line the test runs on whatever node the
+        # host happens to have — or fails outright on a host with none —
+        # instead of the node emsdk installed for us.
+        'export PATH="$(dirname "${EMSDK_NODE:?emsdk_env.sh did not export '
+        'EMSDK_NODE}")":$PATH && '
+        f"export PYODIDE_XBUILDENV_PATH="
+        f"{shlex.quote(str(xbuildenv_root_for(prefix_root)))} && "
+        # `pyodide venv` writes launchers that shell back out to the `pyodide`
+        # CLI by name, so the CLI has to be on PATH; calling it by absolute
+        # path below is not enough on its own.
+        f"export PATH={shlex.quote(str(pyodide_venv_bin))}:$PATH && "
+    )
+
+    execute_shell(
+        f"Creating Pyodide venv at {venv_dir} and installing {wheel.name}",
+        preamble
+        + f"pyodide venv {shlex.quote(str(venv_dir))} && "
+        + f"{shlex.quote(str(venv_dir / 'bin' / 'pip'))} install "
+        + shlex.quote(str(wheel)),
+    )
+
+    smoke_script = build_root(args.type) / "smoke-test.py"
+    smoke_script.write_text(SMOKE_TEST_SOURCE, encoding="utf-8")
+
+    command = preamble + (
+        f"{shlex.quote(str(venv_dir / 'bin' / 'python'))} "
+        f"{shlex.quote(str(smoke_script))}"
+    )
+    print(f"==> Running the headless smoke test from {smoke_script}")
+    print(f"    $ {command}", flush=True)
+    result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    output = result.stdout + result.stderr
+    print(output)
+
+    if result.returncode != 0:
+        sys.exit(
+            f"Smoke test FAILED: the command above exited "
+            f"{result.returncode}; its output has the cause."
+        )
+
+    missing = [s for s in SMOKE_TEST_REQUIRED_OUTPUT if s not in output]
+    if missing:
+        listed = "\n  ".join(repr(s) for s in missing)
+        sys.exit(
+            f"Smoke test FAILED: {smoke_script.name} exited 0, but "
+            f"{len(missing)} of the {len(SMOKE_TEST_REQUIRED_OUTPUT)} "
+            f"required substrings are absent from its output:\n  {listed}"
+        )
+
+    print(f"Smoke test PASSED: {wheel.name} initialises PyRosetta under Pyodide.")
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +803,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Phase 2: source emsdk_env.sh and invoke build.py --target wasm "
             "(Binder + CMake configure + ninja, all in one). "
             "Phase 3: invoke `pyodide build` against the resulting setup.py to "
-            "package a wheel with the cross-compiled extension module."
+            "package a wheel with the cross-compiled extension module. "
+            "Phase 4 (--test): install that wheel into a throwaway Pyodide venv "
+            "and assert that `import pyrosetta; pyrosetta.init()` prints the "
+            "M1 banner."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -662,9 +827,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--skip-pyodide-build-phase", action="store_true",
-        help="Skip Phase 3 (pyodide build). The script stops after Phase 2 "
-             "(or after the toolchain install if --skip-build-phase is also "
-             "set).",
+        help="Skip Phase 3 (pyodide build). Without --test the script stops "
+             "after Phase 2 (or after the toolchain install if "
+             "--skip-build-phase is also set); with --test it goes on to test "
+             "whichever wheel is already in the build root's dist/.",
     )
     parser.add_argument(
         "--print-build-root", action="store_true",
@@ -672,7 +838,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--test", action="store_true",
-        help="(Future task) After building, run the headless smoke test.",
+        help="Phase 4: run the headless smoke test. Installs the wheel into "
+             "a throwaway Pyodide venv under the build root and asserts that "
+             "`import pyrosetta; pyrosetta.init()` prints the M1 banner. "
+             "Pass both --skip flags to test an already-built wheel.",
     )
     parser.add_argument(
         "--clean", action="store_true",
@@ -711,6 +880,8 @@ def main(argv: list[str]) -> int:
         phases.append("build (build.py --target wasm: Binder + CMake + ninja)")
     if not args.skip_pyodide_build_phase:
         phases.append("package (pyodide build)")
+    if args.test:
+        phases.append("test (headless smoke test)")
     print(f"PyRosetta-WASM toolchain prefix: {prefix}")
     print(f"PyRosetta-WASM build root:       {build_root(args.type)}")
     print(f"Phases to run:                   {', '.join(phases)}")
@@ -731,18 +902,37 @@ def main(argv: list[str]) -> int:
     # Phase 2.
     if args.skip_build_phase:
         print("Skipping build phase (--skip-build-phase).")
-        inner_build_root = discover_inner_build_root(args.type)
+        inner_build_root = None
     else:
         inner_build_root = run_build_phase(args, prefix, emsdk_env, pyodide_venv_bin)
 
     # Phase 3.
     if args.skip_pyodide_build_phase:
-        print("Skipping pyodide build phase (--skip-pyodide-build-phase). Done.")
-        return 0
+        print("Skipping pyodide build phase (--skip-pyodide-build-phase).")
+        wheel = None
+    else:
+        if inner_build_root is None:
+            # Phase 2 was skipped, so ask the inner build.py where it left
+            # the generated setup.py. Only the package phase needs this, and
+            # it shells out to build.py, so it stays out of the paths that
+            # do not.
+            inner_build_root = discover_inner_build_root(args.type)
+        wheel = run_pyodide_build_phase(
+            prefix, pyodide_venv_bin, emsdk_env, args, inner_build_root
+        )
+        if args.test and wheel is None:
+            sys.exit(
+                "The package phase produced no wheel to smoke-test. Falling "
+                "back to whatever dist/ still holds would report a pass for "
+                "a build that made nothing."
+            )
 
-    run_pyodide_build_phase(
-        prefix, pyodide_venv_bin, emsdk_env, args, inner_build_root
-    )
+    # Phase 4.
+    if args.test:
+        if wheel is None:
+            wheel = find_wheel_to_test(wheel_dist_dir(args.type))
+        run_test_phase(prefix, pyodide_venv_bin, emsdk_env, args, wheel)
+
     return 0
 
 
