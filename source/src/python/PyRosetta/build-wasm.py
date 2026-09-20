@@ -32,6 +32,10 @@ Pipeline:
 4. Phase 4 — test: install the wheel into a throwaway ``pyodide venv``
    and assert that ``import pyrosetta; pyrosetta.init()`` prints the
    M1 banner. Run only with ``--test``.
+5. Phase 5 — browser test: serve the wheel and the Pyodide runtime on
+   loopback, load them in a pinned ``chrome-headless-shell``, and assert
+   the same banner against what PyRosetta prints inside the browser.
+   Run only with ``--browser-test``.
 
 Host prerequisites:
     - git, curl, bash
@@ -39,21 +43,32 @@ Host prerequisites:
       build.py / Binder build).
     - Python >= 3.8 to run this script (the build's target Python comes
       from uv).
+    - For ``--browser-test`` only: the shared libraries Chrome links
+      against. The phase names any that are missing.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import platform
+import queue
+import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
+import threading
+import time
+import urllib.parse
 import urllib.request
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -78,6 +93,24 @@ EMSDK_REPO = "https://github.com/emscripten-core/emsdk.git"
 UV_RELEASE_URL = (
     "https://github.com/astral-sh/uv/releases/download/{ver}/"
     "uv-{triple}.tar.gz"
+)
+
+# The browser the --browser-test phase drives. Chrome for Testing is Chrome
+# built for automation and pinned by version, which is what makes a browser
+# result reproducible; `chrome-headless-shell` is its headless-only build, a
+# third of the size of full Chrome. Unlike the rest of the toolchain it links
+# against the host's own libraries — see missing_chrome_libraries.
+#
+# Google publishes no checksum next to the archive, so the expected digest is
+# recorded here and verified on download, the way install_uv verifies the
+# .sha256 that uv does publish. Bump the two together; find the current version
+# in
+# https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json
+CHROME_VERSION = "153.0.8010.52"
+CHROME_SHA256 = "944dc1eae654637fed4d57650198774f9c43b45f34e48febb84f43c541b5de76"
+CHROME_RELEASE_URL = (
+    "https://storage.googleapis.com/chrome-for-testing-public/{ver}/"
+    "linux64/chrome-headless-shell-linux64.zip"
 )
 
 
@@ -125,6 +158,20 @@ def xbuildenv_root_for(prefix_root: Path) -> Path:
     """Where ``pyodide xbuildenv install`` writes the cross-build env.
     Shared between the installer and the build phase so they agree."""
     return pyodide_build_install_dir(prefix_root) / "xbuildenv"
+
+
+def pyodide_browser_dist_dir(prefix_root: Path) -> Path:
+    """The browser build of the Pyodide runtime — ``pyodide.js``,
+    ``pyodide.asm.wasm``, ``python_stdlib.zip``, ``pyodide-lock.json`` — which
+    ships inside the cross-build environment. The browser test serves these,
+    so it needs no second copy of Pyodide from the network."""
+    return (
+        xbuildenv_root_for(prefix_root)
+        / PYODIDE_VERSION
+        / "xbuildenv"
+        / "pyodide-root"
+        / "dist"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +462,92 @@ def install_pyodide_build_env(
 
     write_signature(signature_file, signature)
     return venv_bin
+
+
+def install_chrome_headless_shell(
+    prefix_root: Path,
+    version: str = CHROME_VERSION,
+    expected_sha256: str = CHROME_SHA256,
+) -> Path:
+    """Install chrome-headless-shell into
+    <prefix_root>/chrome-headless-shell-<version>/. Return the browser binary.
+
+    ``version`` and ``expected_sha256`` name one release between them, so they
+    move together: Google publishes no checksum next to the archive, leaving
+    nothing to derive the second from the first.
+
+    Only the --browser-test phase calls this, so an ordinary build never pays
+    the download."""
+    install_dir = prefix_root / f"chrome-headless-shell-{version}"
+    chrome_bin = (
+        install_dir / "chrome-headless-shell-linux64" / "chrome-headless-shell"
+    )
+    signature_file = install_dir / ".signature.json"
+    signature = {
+        "tool": "chrome-headless-shell",
+        "version": version,
+        "sha256": expected_sha256,
+    }
+
+    if signature_matches(signature_file, signature) and chrome_bin.is_file():
+        print(f"chrome-headless-shell {version} already installed at {install_dir}")
+        return chrome_bin
+
+    if install_dir.exists():
+        shutil.rmtree(install_dir)
+    install_dir.mkdir(parents=True)
+
+    archive = install_dir / "chrome-headless-shell.zip"
+    download(CHROME_RELEASE_URL.format(ver=version), archive)
+
+    actual_sha = sha256_of(archive)
+    if actual_sha != expected_sha256:
+        sys.exit(
+            f"SHA256 mismatch for the chrome-headless-shell archive:\n"
+            f"  expected: {expected_sha256}\n"
+            f"  actual:   {actual_sha}"
+        )
+    print(f"==> SHA256 verified: {actual_sha}")
+
+    print(f"==> Extracting chrome-headless-shell into {install_dir}")
+    with zipfile.ZipFile(archive) as archive_file:
+        archive_file.extractall(install_dir)
+    if not chrome_bin.is_file():
+        sys.exit(f"chrome-headless-shell not found at {chrome_bin} after extraction")
+    # ZipFile.extractall drops the executable bit.
+    chrome_bin.chmod(0o755)
+
+    archive.unlink()
+    write_signature(signature_file, signature)
+    return chrome_bin
+
+
+def missing_chrome_libraries(chrome_bin: Path) -> list[str]:
+    """Shared libraries the browser needs that this host does not have.
+
+    The browser is the one piece of the toolchain that cannot be made
+    self-contained by downloading it: Chrome links against the distribution's
+    own libraries. Naming exactly which are absent turns an opaque startup
+    failure into an apt-get line.
+
+    An empty list also means "could not tell" on a host with no ``ldd``; the
+    browser then reports the problem itself."""
+    try:
+        result = subprocess.run(
+            ["ldd", str(chrome_bin)],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        return []
+    return sorted(
+        {
+            line.split("=>")[0].strip()
+            for line in result.stdout.splitlines()
+            if "not found" in line
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +944,450 @@ def run_test_phase(
 
 
 # ---------------------------------------------------------------------------
+# Browser test phase — serve the wheel to a real browser and assert the banner.
+# ---------------------------------------------------------------------------
+# Measured at 42 s end to end on the development host: 2 s to boot Pyodide,
+# 9 s to stream the wheel in, 23 s to install it, 7 s to initialise PyRosetta.
+# The ceiling is far above that because a cold CDN fetch and a slower disk both
+# have to fit under it, while a genuine hang still ends the run.
+BROWSER_TEST_TIMEOUT_SECONDS = 900
+
+# How often the browser's memory is sampled while it works. Reading
+# smaps_rollup takes the target's mmap lock, which a renderer allocating
+# gigabytes is itself contending for, so sampling every second measurably
+# slowed the run it was measuring. The peak is a plateau tens of seconds wide,
+# so little is lost by looking less often.
+MEMORY_SAMPLE_INTERVAL_SECONDS = 5
+
+# Packages the cross-build environment does not ship — numpy, which PyRosetta
+# requires — come from the CDN Pyodide itself would use, the same one the
+# headless test installs numpy from.
+PYODIDE_PACKAGE_CDN = f"https://cdn.jsdelivr.net/pyodide/v{PYODIDE_VERSION}/full"
+
+# The server hands out a fixed set of files from two directories. Request paths
+# are matched against this before they are used to name anything, and a leading
+# dot is rejected separately so that "..", which is all legal characters, can
+# not walk out of either directory.
+SERVABLE_FILE_NAME = re.compile(r"[A-Za-z0-9._+-]+")
+
+# A request line arrives from the network, so escape its control characters
+# before printing one. BaseHTTPRequestHandler.log_message does this for the
+# same reason, and this handler overrides it.
+CONTROL_CHARACTER_ESCAPES = {
+    code: f"\\x{code:02x}" for code in [*range(0x20), 0x7F]
+}
+
+
+def servable_name(name: str) -> bool:
+    return bool(SERVABLE_FILE_NAME.fullmatch(name)) and not name.startswith(".")
+
+
+def content_type_for(name: str) -> str:
+    """Content types for the few suffixes the Pyodide runtime is served with.
+    ``application/wasm`` is the one that has to be right: a browser refuses to
+    stream-compile a module served as anything else."""
+    if name.endswith((".js", ".mjs")):
+        return "text/javascript"
+    if name.endswith(".wasm"):
+        return "application/wasm"
+    if name.endswith(".json"):
+        return "application/json"
+    return "application/octet-stream"
+
+
+def redact_token(text: str) -> str:
+    """Blank the value of a ``token=`` query parameter in text about to be
+    printed. The token is what stops anything else on the host from posting a
+    verdict for this run, so it does not belong in a build log."""
+    return re.sub(r"(token=)[^\s&\"]+", r"\1<redacted>", text)
+
+
+def proportional_memory(process: Path, resident_bytes: int) -> int:
+    """One process's share of the memory it has resident, in bytes.
+
+    ``Pss`` divides every shared page among the processes mapping it. Falls
+    back to the resident set on a kernel that does not report ``Pss``, which
+    then over-counts rather than reporting nothing."""
+    try:
+        for line in (process / "smaps_rollup").read_text().splitlines():
+            if line.startswith("Pss:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, IndexError, ValueError):
+        pass
+    return resident_bytes
+
+
+def process_tree_memory(pid: int) -> tuple[int, int]:
+    """Memory held by a process and its descendants: (proportional, resident).
+
+    What a browser costs to run this wheel is the question behind the whole
+    phase, and Chrome spreads that cost across a browser process and a
+    renderer child that share large read-only mappings — the 197 MB binary,
+    the ICU tables, the zygote's copy-on-write heap. Summing each process's
+    resident set counts those pages once per process, so the proportional
+    total is the honest figure and the resident sum its upper bound."""
+    parent_of: dict[int, int] = {}
+    resident: dict[int, int] = {}
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            # comm sits in parentheses and may itself contain spaces, so the
+            # fields after it are found from the last ") " rather than by split.
+            after_comm = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
+            parent_of[int(entry.name)] = int(after_comm[1])
+            resident[int(entry.name)] = (
+                int((entry / "statm").read_text().split()[1]) * page_size
+            )
+        except (OSError, IndexError, ValueError):
+            continue  # The process ended between listing /proc and reading it.
+
+    children: dict[int, list[int]] = {}
+    for child, parent in parent_of.items():
+        children.setdefault(parent, []).append(child)
+
+    # /proc is read one process at a time, so a pid reused mid-scan can leave
+    # two entries recorded as each other's parent. Without `seen` that cycle
+    # would spin here forever, inside the loop that is supposed to be timing
+    # the browser out.
+    seen: set[int] = set()
+    proportional_total = 0
+    resident_total = 0
+    pending = [pid]
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        resident_bytes = resident.get(current, 0)
+        resident_total += resident_bytes
+        proportional_total += proportional_memory(
+            Path("/proc") / str(current), resident_bytes
+        )
+        pending.extend(children.get(current, []))
+    return proportional_total, resident_total
+
+
+def write_private_file(path: Path, text: str) -> None:
+    """Write a file only its owner can read.
+
+    ``Path.write_text`` would leave it at the umask default, which on most
+    hosts means world-readable."""
+    path.unlink(missing_ok=True)  # O_CREAT leaves an existing file's mode.
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def chrome_log_tail(chrome_log: Path, lines: int = 25) -> str:
+    """The end of the browser's own output, for a failure message.
+
+    A renderer killed for running out of memory — the failure this phase
+    exists to catch — announces itself here and nowhere else."""
+    try:
+        recorded = chrome_log.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+    except OSError:
+        return "(the browser wrote nothing)"
+    return "\n".join(recorded[-lines:]) or "(the browser wrote nothing)"
+
+
+class BrowserTestServer(ThreadingHTTPServer):
+    """Serves the test page, the Pyodide runtime and the wheel on loopback.
+
+    Threaded because the page posts progress on a second connection while the
+    ~1 GB wheel is still streaming on the first."""
+
+    daemon_threads = True
+
+    def __init__(
+        self,
+        page_html: bytes,
+        pyodide_dist: Path,
+        wheel: Path,
+        token: str,
+        results: queue.Queue,
+    ) -> None:
+        # Port 0 lets the OS pick a free port, so concurrent runs do not
+        # collide; loopback keeps the wheel off the network.
+        super().__init__(("127.0.0.1", 0), BrowserTestHandler)
+        self.page_html = page_html
+        self.pyodide_dist = pyodide_dist
+        self.wheel = wheel
+        self.token = token
+        self.results = results
+
+
+class BrowserTestHandler(BaseHTTPRequestHandler):
+    """The harness end of the conversation with the page.
+
+    The page reports its own progress and verdict by POST instead of the
+    harness reading them out of the browser. That is what keeps this phase
+    dependency-free: driving the browser over the DevTools protocol would mean
+    a WebSocket client, and there is none in the standard library."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *fmt_args) -> None:
+        # The page's URL carries the result token, and a request line lands in
+        # build and CI logs. Redacting keeps the token to the run it belongs to.
+        line = redact_token(fmt % fmt_args).translate(CONTROL_CHARACTER_ESCAPES)
+        print(f"    [server] {line}", flush=True)
+
+    def do_GET(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/":
+            self.send_bytes(self.server.page_html, "text/html; charset=utf-8")
+        elif path.startswith("/pyodide/"):
+            self.serve_pyodide_file(path[len("/pyodide/") :])
+        elif path.startswith("/wheel/"):
+            self.serve_wheel(path[len("/wheel/") :])
+        else:
+            self.send_bytes(b"not found\n", "text/plain", status=404)
+
+    def do_POST(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            self.send_bytes(b"malformed JSON\n", "text/plain", status=400)
+            return
+
+        # The token is what makes a report *this* run's report: without it a
+        # browser left over from an earlier run, or any other process on the
+        # host, could answer for the page just launched.
+        token = payload.get("token", "") if isinstance(payload, dict) else ""
+        if not secrets.compare_digest(str(token), self.server.token):
+            self.send_bytes(b"bad token\n", "text/plain", status=403)
+            return
+
+        if path == "/log":
+            print(f"    [page] {payload.get('message', '')}", flush=True)
+        elif path == "/result":
+            self.server.results.put(payload)
+        else:
+            self.send_bytes(b"not found\n", "text/plain", status=404)
+            return
+        self.send_bytes(b"", "text/plain")
+
+    def serve_pyodide_file(self, name: str) -> None:
+        if not servable_name(name):
+            self.send_bytes(b"bad name\n", "text/plain", status=400)
+            return
+        local = self.server.pyodide_dist / name
+        if local.is_file():
+            self.send_file(local, content_type_for(name))
+        else:
+            self.redirect(f"{PYODIDE_PACKAGE_CDN}/{name}")
+
+    def serve_wheel(self, name: str) -> None:
+        if name != self.server.wheel.name:
+            self.send_bytes(b"not found\n", "text/plain", status=404)
+            return
+        self.send_file(self.server.wheel, "application/octet-stream")
+
+    def send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def send_file(self, path: Path, content_type: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.end_headers()
+        try:
+            with open(path, "rb") as source:
+                shutil.copyfileobj(source, self.wfile, 1 << 20)
+        except (BrokenPipeError, ConnectionResetError):
+            # The browser went away mid-transfer: a timeout or a failure that
+            # the phase itself reports. Nothing useful to add here.
+            self.close_connection = True
+
+    def redirect(self, url: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", url)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def run_browser_test_phase(
+    prefix_root: Path,
+    args: argparse.Namespace,
+    wheel: Path,
+    chrome_bin: Path,
+) -> None:
+    """Load the wheel in a real browser and assert that
+    ``import pyrosetta; pyrosetta.init()`` prints the M1 banner.
+
+    The headless test proves the same thing under Node, and Node shares V8 with
+    Chrome, so this is not a second run of the same experiment. What only a
+    browser exercises: the wheel arrives over HTTP rather than off the
+    filesystem, the module is fetched and compiled by a tab, and everything
+    lands in a renderer's memory instead of a process with the machine to
+    itself. M1's milestone text asks for a browser, and this is the phase that
+    answers it.
+
+    The verdict comes back from the page by POST, so nothing here speaks the
+    DevTools protocol and no dependency is added."""
+    page = script_dir() / "wasm_browser_test.html"
+    if not page.is_file():
+        sys.exit(f"The browser test page is missing at {page}")
+
+    pyodide_dist = pyodide_browser_dist_dir(prefix_root)
+    if not (pyodide_dist / "pyodide.js").is_file():
+        sys.exit(
+            f"No browser build of Pyodide at {pyodide_dist}. It ships inside "
+            f"the cross-build environment, which Phase 1 installs: delete "
+            f"{pyodide_build_install_dir(prefix_root)} and re-run to rebuild "
+            f"it."
+        )
+
+    absent = missing_chrome_libraries(chrome_bin)
+    if absent:
+        listed = "\n  ".join(absent)
+        sys.exit(
+            f"The browser cannot start: {len(absent)} shared libraries it needs "
+            f"are missing from this host:\n  {listed}\n"
+            f"Install the packages providing them and re-run. On Ubuntu:\n"
+            f"  apt-get install -y libasound2t64 libatk-bridge2.0-0t64 "
+            f"libatk1.0-0t64 libatspi2.0-0t64 libdbus-1-3 libgbm1 "
+            f"libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2"
+        )
+
+    results: queue.Queue = queue.Queue()
+    token = secrets.token_urlsafe(16)
+    server = BrowserTestServer(
+        page.read_bytes(), pyodide_dist, wheel, token, results
+    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    query = urllib.parse.urlencode({"wheel": wheel.name, "token": token})
+    url = f"http://127.0.0.1:{server.server_address[1]}/?{query}"
+
+    # The URL carries the result token, and a process's command line is
+    # readable by every account on the host — /proc/<pid>/cmdline is
+    # world-readable, where a file need not be. So the browser is started on a
+    # private bootstrap page that redirects to the real URL, and its command
+    # line holds nothing but a path.
+    launch_page = build_root(args.type) / "browser-test-launch.html"
+    write_private_file(
+        launch_page,
+        "<!doctype html>\n"
+        '<meta charset="utf-8">\n'
+        f'<meta http-equiv="refresh" content="0; url={html.escape(url)}">\n'
+        "<title>Starting the PyRosetta-WASM browser test</title>\n",
+    )
+
+    profile_dir = build_root(args.type) / "browser-test-profile"
+    if profile_dir.exists():
+        shutil.rmtree(profile_dir)
+    chrome_log = build_root(args.type) / "browser-test-chrome.log"
+
+    command = [
+        str(chrome_bin),
+        "--headless",
+        "--disable-gpu",
+        # A container's /dev/shm is usually 64 MB, and Chrome does not degrade
+        # gracefully when it fills.
+        "--disable-dev-shm-usage",
+        "--no-first-run",
+        f"--user-data-dir={profile_dir}",
+    ]
+    if os.geteuid() == 0:
+        # Chrome refuses to run as root with its sandbox on. A host where the
+        # build runs unprivileged keeps the sandbox.
+        command.append("--no-sandbox")
+    command.append(launch_page.as_uri())
+
+    print(
+        f"==> Serving {wheel.name} ({wheel.stat().st_size:,} bytes) at "
+        f"{redact_token(url)}"
+    )
+    print(f"    $ {redact_token(' '.join(command))}", flush=True)
+
+    started = time.monotonic()
+    peak_proportional = 0
+    peak_resident = 0
+    last_sample = 0.0
+    with open(chrome_log, "w", encoding="utf-8") as log_file:
+        browser = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT)
+        try:
+            while True:
+                try:
+                    report = results.get(timeout=1.0)
+                    break
+                except queue.Empty:
+                    pass
+                now = time.monotonic()
+                if now - last_sample >= MEMORY_SAMPLE_INTERVAL_SECONDS:
+                    last_sample = now
+                    proportional, resident = process_tree_memory(browser.pid)
+                    peak_proportional = max(peak_proportional, proportional)
+                    peak_resident = max(peak_resident, resident)
+                waited = now - started
+                if browser.poll() is not None:
+                    sys.exit(
+                        f"Browser test FAILED: the browser exited "
+                        f"{browser.returncode} after {waited:.0f}s without "
+                        f"reporting a result. Its last output, from "
+                        f"{chrome_log}:\n{chrome_log_tail(chrome_log)}"
+                    )
+                if waited > BROWSER_TEST_TIMEOUT_SECONDS:
+                    sys.exit(
+                        f"Browser test FAILED: no result after "
+                        f"{BROWSER_TEST_TIMEOUT_SECONDS}s. The page logs above "
+                        f"show the last stage it reached; the browser's last "
+                        f"output, from {chrome_log}:\n"
+                        f"{chrome_log_tail(chrome_log)}"
+                    )
+        finally:
+            browser.terminate()
+            try:
+                browser.wait(30)
+            except subprocess.TimeoutExpired:
+                browser.kill()
+            server.shutdown()
+            server.server_close()
+            launch_page.unlink(missing_ok=True)
+
+    elapsed = time.monotonic() - started
+    for stage in report.get("marks", []):
+        detail = {k: v for k, v in stage.items() if k not in ("name", "seconds")}
+        print(f"    {stage.get('seconds', 0):7.1f}s  {stage.get('name', '?')}  {detail}")
+    output = report.get("output", "")
+    print(output)
+    print(
+        f"==> Browser run took {elapsed:.0f}s; peak browser memory "
+        f"{peak_proportional / 1e9:.1f} GB proportional, "
+        f"{peak_resident / 1e9:.1f} GB summed resident"
+    )
+
+    if not report.get("ok"):
+        sys.exit(
+            f"Browser test FAILED: the page reported an error:\n"
+            f"{report.get('error', '(none given)')}\n"
+            f"The browser's own output is in {chrome_log}."
+        )
+
+    missing = [s for s in SMOKE_TEST_REQUIRED_OUTPUT if s not in output]
+    if missing:
+        listed = "\n  ".join(repr(s) for s in missing)
+        sys.exit(
+            f"Browser test FAILED: the page finished, but {len(missing)} of the "
+            f"{len(SMOKE_TEST_REQUIRED_OUTPUT)} required substrings are absent "
+            f"from what PyRosetta printed:\n  {listed}"
+        )
+
+    print(f"Browser test PASSED: {wheel.name} initialises PyRosetta in a browser.")
+
+
+# ---------------------------------------------------------------------------
 # CLI / main.
 # ---------------------------------------------------------------------------
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -825,7 +1402,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "package a wheel with the cross-compiled extension module. "
             "Phase 4 (--test): install that wheel into a throwaway Pyodide venv "
             "and assert that `import pyrosetta; pyrosetta.init()` prints the "
-            "M1 banner."
+            "M1 banner. "
+            "Phase 5 (--browser-test): serve that wheel to a real browser and "
+            "assert the same banner."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -861,6 +1440,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "a throwaway Pyodide venv under the build root and asserts that "
              "`import pyrosetta; pyrosetta.init()` prints the M1 banner. "
              "Pass both --skip flags to test an already-built wheel.",
+    )
+    parser.add_argument(
+        "--browser-test", action="store_true",
+        help="Phase 5: run the same assertions in a real browser. Serves the "
+             "wheel and the Pyodide runtime on loopback and loads them in a "
+             "pinned chrome-headless-shell, downloaded into the toolchain "
+             "prefix on first use. Needs Chrome's system libraries on the "
+             "host; the phase names any that are missing. Pass both --skip "
+             "flags to test an already-built wheel.",
     )
     parser.add_argument(
         "--clean", action="store_true",
@@ -901,6 +1489,8 @@ def main(argv: list[str]) -> int:
         phases.append("package (pyodide build)")
     if args.test:
         phases.append("test (headless smoke test)")
+    if args.browser_test:
+        phases.append("browser test (chrome-headless-shell)")
     print(f"PyRosetta-WASM toolchain prefix: {prefix}")
     print(f"PyRosetta-WASM build root:       {build_root(args.type)}")
     print(f"Phases to run:                   {', '.join(phases)}")
@@ -939,18 +1529,24 @@ def main(argv: list[str]) -> int:
         wheel = run_pyodide_build_phase(
             prefix, pyodide_venv_bin, emsdk_env, args, inner_build_root
         )
-        if args.test and wheel is None:
+        if (args.test or args.browser_test) and wheel is None:
             sys.exit(
                 "The package phase produced no wheel to smoke-test. Falling "
                 "back to whatever dist/ still holds would report a pass for "
                 "a build that made nothing."
             )
 
+    if (args.test or args.browser_test) and wheel is None:
+        wheel = find_wheel_to_test(wheel_dist_dir(args.type))
+
     # Phase 4.
     if args.test:
-        if wheel is None:
-            wheel = find_wheel_to_test(wheel_dist_dir(args.type))
         run_test_phase(prefix, pyodide_venv_bin, emsdk_env, args, wheel)
+
+    # Phase 5.
+    if args.browser_test:
+        chrome_bin = install_chrome_headless_shell(prefix)
+        run_browser_test_phase(prefix, args, wheel, chrome_bin)
 
     return 0
 

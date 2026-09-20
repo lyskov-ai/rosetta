@@ -1,0 +1,158 @@
+<!doctype html>
+<!--
+  Browser end of the `build-wasm.py --browser-test` phase: load Pyodide, install
+  the PyRosetta wheel, and run `pyrosetta.init()`, reporting everything Python
+  and the C++ tracer write back to the harness.
+
+  The harness serves this page and passes `wheel` and `token` as query
+  parameters. Opened by hand against any server that also serves /pyodide/ and
+  /wheel/, the page still runs and prints its progress; only the POSTs go
+  nowhere.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>PyRosetta-WASM browser test</title>
+</head>
+<body>
+<h1>PyRosetta-WASM browser test</h1>
+<pre id="progress"></pre>
+<script src="/pyodide/pyodide.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+const WHEEL = params.get("wheel");
+const TOKEN = params.get("token") || "";
+
+// Everything Python and the C++ tracer write, in order. The harness asserts the
+// PyRosetta banner against this, so nothing here may filter or reformat it.
+const captured = [];
+const marks = [];
+const started = performance.now();
+
+function elapsed() {
+  return (performance.now() - started) / 1000;
+}
+
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({token: TOKEN, ...body}),
+  }).catch(() => {});  // A page opened by hand has no harness to report to.
+}
+
+function log(message) {
+  document.getElementById("progress").textContent += message + "\n";
+  return post("/log", {message: `[${elapsed().toFixed(1)}s] ${message}`});
+}
+
+function mark(name, detail) {
+  marks.push({name, seconds: elapsed(), ...(detail || {})});
+  return log(`--- ${name} ${detail ? JSON.stringify(detail) : ""}`);
+}
+
+// Bytes of wasm linear memory in use. This is the number with a hard ceiling:
+// wasm32 addresses at most 4 GB however much memory the machine has.
+function wasmHeapBytes(pyodide) {
+  try {
+    return pyodide._module.HEAPU8.length;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Stream the wheel into the Pyodide filesystem instead of buffering it whole in
+// JavaScript, then install it from there: micropip reads `emfs:` URLs off that
+// filesystem. At ~1 GB the difference is worth the few extra lines.
+async function fetchWheelIntoFilesystem(pyodide, url, path) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`fetching ${url} failed: ${response.status} ${response.statusText}`);
+  }
+  const total = Number(response.headers.get("content-length") || 0);
+  const reader = response.body.getReader();
+  const handle = pyodide.FS.open(path, "w");
+  let written = 0;
+  let nextReport = 250e6;
+  try {
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      pyodide.FS.write(handle, value, 0, value.length, written);
+      written += value.length;
+      if (written >= nextReport) {
+        nextReport += 250e6;
+        await log(`    ${(written / 1e6).toFixed(0)} of ${(total / 1e6).toFixed(0)} MB`);
+      }
+    }
+  } finally {
+    pyodide.FS.close(handle);
+  }
+  // A short read would otherwise surface much later as a corrupt-zip error.
+  if (total && written !== total) {
+    throw new Error(`${url} ended after ${written} of ${total} bytes`);
+  }
+  return written;
+}
+
+async function run() {
+  if (!WHEEL) throw new Error("no ?wheel= parameter: nothing to install");
+  await mark("page-loaded", {userAgent: navigator.userAgent});
+
+  const pyodide = await loadPyodide({
+    indexURL: "/pyodide/",
+    stdout: (line) => captured.push(line),
+    stderr: (line) => captured.push(line),
+  });
+  await mark("pyodide-booted", {
+    pyodide: pyodide.version,
+    wasmHeap: wasmHeapBytes(pyodide),
+  });
+
+  pyodide.FS.mkdirTree("/wheels");
+  const wheelPath = `/wheels/${WHEEL}`;
+  const bytes = await fetchWheelIntoFilesystem(pyodide, `/wheel/${WHEEL}`, wheelPath);
+  await mark("wheel-fetched", {bytes, wasmHeap: wasmHeapBytes(pyodide)});
+
+  await pyodide.loadPackage("micropip");
+  const micropip = pyodide.pyimport("micropip");
+  await micropip.install(`emfs:${wheelPath}`);
+  // The unpacked copy under site-packages is what gets imported, so the
+  // archive is dead weight from here on. It lives in the Pyodide filesystem,
+  // which is JavaScript memory rather than wasm linear memory, so dropping it
+  // gives the tab back ~1 GB and leaves the wasm heap untouched.
+  pyodide.FS.unlink(wheelPath);
+  await mark("wheel-installed", {wasmHeap: wasmHeapBytes(pyodide)});
+
+  // `pyrosetta._is_interactive()` asks whether `__main__` has a `__file__`, and
+  // in a browser it never does. A plain `init()` would therefore take the
+  // interactive branch, mute the C++ tracer and route the banner through
+  // Python's `logging` — so the assertions would pass without the C++ stdout
+  // path, the one an emscripten stdout fault would break and the one a browser
+  // console shows, ever running. `set_logging_handler=False` is the public way
+  // to ask for that path, and is what the headless test gets by running from a
+  // file.
+  await pyodide.runPythonAsync(`
+import pyrosetta
+pyrosetta.init(set_logging_handler=False)
+`);
+  await mark("pyrosetta-initialised", {wasmHeap: wasmHeapBytes(pyodide)});
+}
+
+window.addEventListener("error", (event) =>
+  post("/log", {message: `uncaught error: ${event.message}`}));
+window.addEventListener("unhandledrejection", (event) =>
+  post("/log", {message: `unhandled rejection: ${event.reason}`}));
+
+run().then(
+  () => post("/result", {ok: true, marks, output: captured.join("\n")}),
+  (error) => post("/result", {
+    ok: false,
+    error: String((error && error.stack) || error),
+    marks,
+    output: captured.join("\n"),
+  }),
+);
+</script>
+</body>
+</html>
