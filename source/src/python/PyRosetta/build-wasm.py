@@ -28,7 +28,10 @@ Pipeline:
    Skipped by ``--skip-build-phase``.
 3. Phase 3 — package: invoke ``pyodide build`` against the resulting
    ``setup.py``. The wheel post-processor renames the ``.so`` to
-   carry the Pyodide ABI tag. Skipped by ``--skip-pyodide-build-phase``.
+   carry the Pyodide ABI tag. The wheel is then rewritten without the
+   database subtrees outside core protein modelling, which takes it
+   from about 964 MB to about 172 MB; ``--database full`` keeps it
+   whole. Skipped by ``--skip-pyodide-build-phase``.
 4. Phase 4 — test: install the wheel into a throwaway ``pyodide venv``
    and assert that ``import pyrosetta; pyrosetta.init()`` prints the
    M1 banner. Run only with ``--test``.
@@ -50,8 +53,11 @@ Host prerequisites:
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
 import hashlib
 import html
+import io
 import json
 import os
 import platform
@@ -805,6 +811,189 @@ def run_pyodide_build_phase(
 
 
 # ---------------------------------------------------------------------------
+# Database subsetting — drop the parts of the Rosetta database a core
+# protein-modelling wheel does not need.
+# ---------------------------------------------------------------------------
+# The database is 95% of the wheel — 912.6 MB of 964.1 MB compressed — and
+# `pyrosetta.init()` reads none of it: traced through the filesystem, init
+# opens all 540 directories and not one of the 7,623 files. A run that then
+# builds a pose, scores it with ref2015, repacks and minimises reads 896 of
+# them, 21.3 MB compressed.
+#
+# So the default wheel carries a subset. A subtree is dropped when it serves a
+# protocol family outside core protein modelling, or when it is a legacy or
+# alternative parameterisation that only a non-default flag selects.
+#
+# Two things override that, and both cost far less than they look:
+#
+#   - Anything whose absence is a hard exit or a silently wrong answer, rather
+#     than a clean failure, stays regardless of which subtree it sits in.
+#     `sampling/` is 264 MB of fragment libraries wrapped around 1.1 MB that
+#     core modelling needs: `SASA-masks.dat` and `SASA-angles.dat`, which
+#     `core/scoring/sasa.cc:110,130` streams into fixed arrays without ever
+#     checking `good()` — absent, every SASA number is quietly computed against
+#     a zero-filled table — and `relax_scripts/`, without which
+#     `RelaxScriptManager.cc:168` exits and FastRelax cannot run. Likewise
+#     `chemical/pdb_components/` is 95 MB of ligand dictionary around a 93-byte
+#     `override.txt` that `GlobalResidueTypeSet.cc:901` exits without, on the
+#     first PDB residue it does not recognise.
+#
+#   - `-beta` / `-beta_nov16` is a mainstream score function, not an exotic
+#     correction, and `score_function_corrections.cc:1971` points `dun10_dir`
+#     at `rotamer/beta_nov2016` when it is passed, so that stays too.
+#
+# The rule is deliberately coarser than the 896 files a traced run actually
+# reads, and costs about 130 MB more than they would. A list derived from one
+# trace would leave the first protocol that stepped outside it failing at
+# runtime on a missing file, with nothing to suggest the wheel was the reason.
+# `--database full` ships the database whole.
+DATABASE_ROOT_IN_WHEEL = "pyrosetta/database/"
+
+CORE_DATABASE_DROPPED_SUBTREES = (
+    # Protocol families outside core protein modelling.
+    "chemical/pdb_components/components.",  # the PDB ligand dictionary, 41 .cif
+    "chemical/rdkit/",
+    "external/",                     # SVM models, SPARTA+
+    "protocol_data/",                # antibody, splice, protein_mpnn, tensorflow
+    "rotamer/ncaa_rotlibs/",         # non-canonical amino acids
+    "rotamer/peptoid_rotlibs/",
+    "sampling/antibodies/",
+    "sampling/disulfide_jump_database_wip.dat",
+    "sampling/filtered.vall.",       # fragment libraries: the four vall files
+    "sampling/fragpicker_rama_tables/",
+    "sampling/orientations/",
+    "sampling/rna/",
+    "sampling/small.vall.gz",
+    "sampling/spheres/",
+    "sampling/ss_fragfiles/",
+    "sampling/vall.",
+    "scoring/loop_close/",           # KIC loop-closure statistics
+    "scoring/qsar/",
+    "scoring/rna/",
+    "sequence/genome_9mers/",
+    "sequence/mhc_",                 # mhc_pssms, mhc_rank_svm_scores, mhc_svms
+    "sequence/tcell_ep_9mers/",
+    # Legacy or alternative parameterisations, each behind a non-default flag.
+    "rotamer/ExtendedOpt1-5/",       # dun10_dir's declared default, shadowed
+                                     # at runtime by the shapovalov fixes
+    "rotamer/bbdep02.May.sortlib",   # the 2002 Dunbrack library, both copies
+    "rotamer/cenrot_dunbrack.lib",   # centroid rotamers, -score:cenrot
+    "rotamer/corrections_conway2016/",
+)
+
+# rotamer/shapovalov/ carries the 2010 Dunbrack library at six smoothing
+# levels of about 20 MB each, alike in coverage and differing in how far the
+# probabilities are smoothed. -shap_dun10_dir selects one and
+# score_function_corrections.cc:620 defaults it to this one, which is also the
+# only level a traced default-flags run reads, so the other five go. Handled
+# apart from the list above because it keeps a subtree rather than dropping one.
+CORE_DATABASE_KEPT_SHAPOVALOV = "rotamer/shapovalov/StpDwn_0-0-0/"
+
+# Read and written a megabyte at a time, so repacking a 964 MB wheel does not
+# hold a 282 MB rosetta.so in memory to copy it.
+WHEEL_COPY_CHUNK_BYTES = 1024 * 1024
+
+
+def core_database_keeps(relative_path: str) -> bool:
+    """Whether the core wheel keeps this database file.
+
+    The path is relative to the database root inside the wheel, so
+    "scoring/score_functions/rama/fd/all.ramaProb", not the "pyrosetta/
+    database/" prefix that precedes it."""
+    if relative_path.startswith("rotamer/shapovalov/"):
+        return relative_path.startswith(CORE_DATABASE_KEPT_SHAPOVALOV)
+    return not relative_path.startswith(CORE_DATABASE_DROPPED_SUBTREES)
+
+
+def copy_wheel_entry(
+    source: zipfile.ZipFile, target: zipfile.ZipFile, entry: zipfile.ZipInfo
+) -> tuple[str, str, int]:
+    """Copy one entry between wheels and return its RECORD row.
+
+    Compression method, timestamp and mode are carried across so that only
+    the dropped files distinguish the rewritten wheel from its source."""
+    copy = zipfile.ZipInfo(entry.filename, date_time=entry.date_time)
+    copy.compress_type = entry.compress_type
+    copy.external_attr = entry.external_attr
+    digest = hashlib.sha256()
+    size = 0
+    # Writing through ZipFile.open refuses anything past 2 GB unless ZIP64 is
+    # asked for up front, because it has to size the header before it has the
+    # data. No entry is near that today — rosetta.so is the largest at 282 MB
+    # — so this only keeps a future one from failing mid-repack.
+    zip64 = entry.file_size >= 2**31
+    with source.open(entry) as reader, target.open(copy, "w", force_zip64=zip64) as writer:
+        while chunk := reader.read(WHEEL_COPY_CHUNK_BYTES):
+            digest.update(chunk)
+            size += len(chunk)
+            writer.write(chunk)
+    encoded = base64.urlsafe_b64encode(digest.digest()).rstrip(b"=").decode("ascii")
+    return entry.filename, f"sha256={encoded}", size
+
+
+def write_core_database_wheel(wheel: Path) -> Path:
+    """Rewrite ``wheel`` without the database files the core policy drops.
+
+    The wheel is replaced rather than written alongside, because the test
+    phases take the single wheel in dist/ and would otherwise have two to
+    choose between — and the one they picked would decide what the smoke
+    test actually proved."""
+    with zipfile.ZipFile(wheel) as source:
+        record_name = next(
+            (n for n in source.namelist() if n.endswith(".dist-info/RECORD")), None
+        )
+        if record_name is None:
+            sys.exit(
+                f"{wheel} carries no .dist-info/RECORD, so it is not a wheel "
+                f"this can safely rewrite. Refusing to repack it."
+            )
+
+        temporary = wheel.with_name(wheel.name + ".repacking")
+        rows: list[tuple[str, str, int]] = []
+        kept = dropped = 0
+        dropped_bytes = 0
+        try:
+            with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as target:
+                for entry in source.infolist():
+                    name = entry.filename
+                    if name == record_name:
+                        continue  # rewritten below, once the kept set is known
+                    if name.startswith(DATABASE_ROOT_IN_WHEEL):
+                        relative = name[len(DATABASE_ROOT_IN_WHEEL):]
+                        if not core_database_keeps(relative):
+                            dropped += 1
+                            dropped_bytes += entry.compress_size
+                            continue
+                        kept += 1
+                    row = copy_wheel_entry(source, target, entry)
+                    if not name.endswith("/"):
+                        rows.append(row)
+
+                # RECORD is a CSV file and four database paths really do
+                # contain a comma, so it is written with the csv module
+                # rather than by joining on one. Its own line carries no
+                # hash or size, which is what PEP 376 asks for.
+                record = io.StringIO()
+                record_writer = csv.writer(record, lineterminator="\n")
+                record_writer.writerows(rows)
+                record_writer.writerow((record_name, "", ""))
+                target.writestr(record_name, record.getvalue())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    before = wheel.stat().st_size
+    os.replace(temporary, wheel)
+    after = wheel.stat().st_size
+    print()
+    print(f"Database subset applied to {wheel.name}:")
+    print(f"  database files kept:    {kept:,}")
+    print(f"  database files dropped: {dropped:,} ({dropped_bytes:,} compressed bytes)")
+    print(f"  wheel: {before:,} -> {after:,} bytes")
+    return wheel
+
+
+# ---------------------------------------------------------------------------
 # Test phase — install the wheel into a Pyodide venv and run the smoke test.
 # ---------------------------------------------------------------------------
 # What `pyrosetta.init()` has to print for the M1 smoke test to pass. Only
@@ -1431,6 +1620,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "whichever wheel is already in the build root's dist/.",
     )
     parser.add_argument(
+        "--database", default="core", choices=["core", "full"],
+        help="How much of the Rosetta database the wheel carries. 'core' "
+             "(the default) leaves out the database subtrees outside core "
+             "protein modelling, taking the wheel from about 964 MB to "
+             "about 172 MB; 'full' ships it whole. Applied to the wheel the "
+             "package phase produces, so it does nothing under "
+             "--skip-pyodide-build-phase.",
+    )
+    parser.add_argument(
         "--print-build-root", action="store_true",
         help="Print the WASM build root path and exit.",
     )
@@ -1487,6 +1685,8 @@ def main(argv: list[str]) -> int:
         phases.append("build (build.py --target wasm: Binder + CMake + ninja)")
     if not args.skip_pyodide_build_phase:
         phases.append("package (pyodide build)")
+        if args.database == "core":
+            phases.append("database subset (--database core)")
     if args.test:
         phases.append("test (headless smoke test)")
     if args.browser_test:
@@ -1535,6 +1735,8 @@ def main(argv: list[str]) -> int:
                 "back to whatever dist/ still holds would report a pass for "
                 "a build that made nothing."
             )
+        if wheel is not None and args.database == "core":
+            wheel = write_core_database_wheel(wheel)
 
     if (args.test or args.browser_test) and wheel is None:
         wheel = find_wheel_to_test(wheel_dist_dir(args.type))
