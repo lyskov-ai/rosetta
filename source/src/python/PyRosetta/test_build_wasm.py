@@ -25,10 +25,14 @@ import csv
 import hashlib
 import importlib.util
 import io
+import os
+import queue
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 def load_build_wasm():
@@ -286,6 +290,151 @@ class WriteCoreDatabaseWheelTest(unittest.TestCase):
         self.assertEqual(
             sorted(p.name for p in self.wheel.parent.iterdir()), [self.wheel.name]
         )
+
+
+class FakeBrowser:
+    """Stands in for the ``subprocess.Popen`` of a browser.
+
+    ``wait_for_browser_result`` only ever asks a browser for its pid and
+    whether it has exited."""
+
+    def __init__(self, pid: int, returncode: int | None = None) -> None:
+        self.pid = pid
+        self.returncode = returncode
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+class ReportAfter:
+    """A results queue that is empty for the first `polls` gets, then answers.
+
+    Stands in for the real queue so a test can count polls without waiting a
+    second for each one."""
+
+    def __init__(self, polls: int, report: dict) -> None:
+        self.polls = polls
+        self.report = report
+
+    def get(self, timeout: float) -> dict:
+        if self.polls > 0:
+            self.polls -= 1
+            raise queue.Empty
+        return self.report
+
+
+class MemorySamplerTest(unittest.TestCase):
+    """What the browser test's memory sampler keeps and what it records."""
+
+    def test_keeps_the_largest_reading_not_the_latest(self):
+        """The maximum can fall anywhere in the run — interior for a wheel big
+        enough that unlinking the archive matters — so a later, smaller
+        reading must not replace it."""
+        sampler = build_wasm.MemorySampler(os.getpid())
+        readings = [(6_000_000_000, 6_300_000_000), (1_000, 2_000)]
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", side_effect=readings
+        ):
+            sampler.sample()
+            sampler.sample()
+        self.assertEqual(sampler.peak_proportional, 6_000_000_000)
+        self.assertEqual(sampler.peak_resident, 6_300_000_000)
+        self.assertEqual(sampler.samples, 2)
+
+    def test_adds_up_what_the_samples_cost(self):
+        """The phase prints this, because it grows with the memory measured and
+        is the perturbation the figure carries."""
+        sampler = build_wasm.MemorySampler(os.getpid())
+
+        def slow_reading(pid):
+            time.sleep(0.05)
+            return 1, 1
+
+        with mock.patch.object(build_wasm, "process_tree_memory", slow_reading):
+            sampler.sample()
+            sampler.sample()
+        self.assertGreaterEqual(sampler.cost, 0.1)
+
+    def test_reads_the_memory_of_a_real_process_tree(self):
+        """No mock: this exercises /proc against the interpreter running the
+        test, which is the only process tree a unit test can count on."""
+        sampler = build_wasm.MemorySampler(os.getpid())
+        sampler.sample()
+        # A CPython process holds megabytes, so this is well clear of the zero
+        # that a /proc read gone wrong would report.
+        self.assertGreater(sampler.peak_proportional, 1_000_000)
+        self.assertGreater(sampler.peak_resident, 1_000_000)
+
+
+class WaitForBrowserResultTest(unittest.TestCase):
+    """The loop that waits out a browser run and samples it."""
+
+    MISSING_LOG = Path("/nonexistent/browser-test-chrome.log")
+
+    def test_takes_a_final_sample_once_the_verdict_is_in(self):
+        """A verdict waiting in the queue is returned without a single poll, so
+        the one sample taken here is the final one and nothing else."""
+        results = queue.Queue()
+        results.put({"ok": True})
+        sampler = build_wasm.MemorySampler(os.getpid())
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", lambda pid: (7, 9)
+        ):
+            report = build_wasm.wait_for_browser_result(
+                FakeBrowser(os.getpid()),
+                results,
+                sampler,
+                time.monotonic(),
+                self.MISSING_LOG,
+            )
+        self.assertEqual(report, {"ok": True})
+        self.assertEqual(sampler.samples, 1)
+        self.assertEqual(sampler.peak_proportional, 7)
+
+    def test_samples_on_every_poll_it_waits_out(self):
+        sampler = build_wasm.MemorySampler(os.getpid())
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", lambda pid: (1, 1)
+        ):
+            build_wasm.wait_for_browser_result(
+                FakeBrowser(os.getpid()),
+                ReportAfter(3, {"ok": True}),
+                sampler,
+                time.monotonic(),
+                self.MISSING_LOG,
+            )
+        self.assertEqual(sampler.samples, 4, "three polls, then the verdict")
+
+    def test_a_browser_that_exits_without_reporting_fails_the_phase(self):
+        sampler = build_wasm.MemorySampler(os.getpid())
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", lambda pid: (1, 1)
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                build_wasm.wait_for_browser_result(
+                    FakeBrowser(os.getpid(), returncode=9),
+                    ReportAfter(5, {"ok": True}),
+                    sampler,
+                    time.monotonic(),
+                    self.MISSING_LOG,
+                )
+        self.assertIn("the browser exited 9", str(raised.exception))
+
+    def test_a_run_past_the_timeout_fails_the_phase(self):
+        sampler = build_wasm.MemorySampler(os.getpid())
+        overran = time.monotonic() - build_wasm.BROWSER_TEST_TIMEOUT_SECONDS - 1
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", lambda pid: (1, 1)
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                build_wasm.wait_for_browser_result(
+                    FakeBrowser(os.getpid()),
+                    ReportAfter(5, {"ok": True}),
+                    sampler,
+                    overran,
+                    self.MISSING_LOG,
+                )
+        self.assertIn("no result after", str(raised.exception))
 
 
 if __name__ == "__main__":

@@ -1141,12 +1141,18 @@ def run_test_phase(
 # have to fit under it, while a genuine hang still ends the run.
 BROWSER_TEST_TIMEOUT_SECONDS = 900
 
-# How often the browser's memory is sampled while it works. Reading
-# smaps_rollup takes the target's mmap lock, which a renderer allocating
-# gigabytes is itself contending for, so sampling every second measurably
-# slowed the run it was measuring. The peak is a plateau tens of seconds wide,
-# so little is lost by looking less often.
-MEMORY_SAMPLE_INTERVAL_SECONDS = 5
+# How often the browser is asked whether it has a verdict yet. Every poll also
+# samples its memory, so this is the sampling period too. Reading smaps_rollup
+# walks the target's page tables under its mmap lock, which a renderer
+# allocating gigabytes is itself contending for, so a sample costs more the
+# more the browser holds: measured at roughly 20 ms per GB, 8 ms with the
+# browser idle and 122 ms at a 6 GB peak. Polling and sampling in lockstep
+# bounds that: the loop turns over in this interval plus one sample, so the
+# gap between samples grows by the cost of a sample rather than in proportion
+# to it — 1.12 s at the 6 GB peak measured. A schedule that stretched as the
+# browser grew would instead resolve a large configuration worst, which is the
+# bias this phase exists to avoid.
+BROWSER_POLL_INTERVAL_SECONDS = 1.0
 
 # Packages the cross-build environment does not ship — numpy, which PyRosetta
 # requires — come from the CDN Pyodide itself would use, the same one the
@@ -1256,6 +1262,42 @@ def process_tree_memory(pid: int) -> tuple[int, int]:
         )
         pending.extend(children.get(current, []))
     return proportional_total, resident_total
+
+
+class MemorySampler:
+    """Peak memory of the browser process tree, sampled while the page works.
+
+    Where the maximum falls depends on the wheel, so nothing here assumes.
+    Against the 188 MB core wheel memory climbs until the page posts its
+    verdict and the run stops right there — measured, the final second still
+    added 0.4 GB, which is how the same work reported 4.3 GB on the 5 s
+    schedule this phase used to keep and 6.0 GB on a 1 s one. Against a large
+    wheel the maximum is interior instead: ``wasm_browser_test.html`` unlinks
+    the archive as soon as micropip has unpacked it, handing a ~1 GB wheel's
+    tab about that much back before PyRosetta starts, and 0031 attributed the
+    9.8 GB peak of the 966 MB wheel to that unpack. So the peak is taken from
+    a sample on every poll, plus one more when the verdict arrives.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.peak_proportional = 0
+        self.peak_resident = 0
+        self.samples = 0
+        self.cost = 0.0
+
+    def sample(self) -> None:
+        """Record one reading of the tree's memory, and what taking it cost.
+
+        The cost is worth keeping because it grows with the memory being
+        measured, so the phase can report how much of the run it spent looking
+        rather than leave the perturbation to be guessed at."""
+        started = time.monotonic()
+        proportional, resident = process_tree_memory(self.pid)
+        self.cost += time.monotonic() - started
+        self.peak_proportional = max(self.peak_proportional, proportional)
+        self.peak_resident = max(self.peak_resident, resident)
+        self.samples += 1
 
 
 def write_private_file(path: Path, text: str) -> None:
@@ -1406,6 +1448,50 @@ class BrowserTestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+def wait_for_browser_result(
+    browser: subprocess.Popen,
+    results: queue.Queue,
+    sampler: MemorySampler,
+    started: float,
+    chrome_log: Path,
+) -> dict:
+    """Wait for the page to post its verdict, sampling memory as it works.
+
+    The poll period doubles as the sampling period — see
+    ``BROWSER_POLL_INTERVAL_SECONDS``. One more sample is taken once the
+    verdict is in hand: it arrives at the instant PyRosetta finishes
+    initialising, which no poll lands on, and against the core wheel that is
+    the largest the browser ever gets.
+
+    Exits rather than returning if the browser dies or the run overruns, since
+    neither leaves a verdict to report."""
+    while True:
+        try:
+            report = results.get(timeout=BROWSER_POLL_INTERVAL_SECONDS)
+            break
+        except queue.Empty:
+            pass
+        sampler.sample()
+        waited = time.monotonic() - started
+        if browser.poll() is not None:
+            sys.exit(
+                f"Browser test FAILED: the browser exited "
+                f"{browser.returncode} after {waited:.0f}s without "
+                f"reporting a result. Its last output, from "
+                f"{chrome_log}:\n{chrome_log_tail(chrome_log)}"
+            )
+        if waited > BROWSER_TEST_TIMEOUT_SECONDS:
+            sys.exit(
+                f"Browser test FAILED: no result after "
+                f"{BROWSER_TEST_TIMEOUT_SECONDS}s. The page logs above "
+                f"show the last stage it reached; the browser's last "
+                f"output, from {chrome_log}:\n"
+                f"{chrome_log_tail(chrome_log)}"
+            )
+    sampler.sample()
+    return report
+
+
 def run_browser_test_phase(
     prefix_root: Path,
     args: argparse.Namespace,
@@ -1501,40 +1587,13 @@ def run_browser_test_phase(
     print(f"    $ {redact_token(' '.join(command))}", flush=True)
 
     started = time.monotonic()
-    peak_proportional = 0
-    peak_resident = 0
-    last_sample = 0.0
     with open(chrome_log, "w", encoding="utf-8") as log_file:
         browser = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT)
+        sampler = MemorySampler(browser.pid)
         try:
-            while True:
-                try:
-                    report = results.get(timeout=1.0)
-                    break
-                except queue.Empty:
-                    pass
-                now = time.monotonic()
-                if now - last_sample >= MEMORY_SAMPLE_INTERVAL_SECONDS:
-                    last_sample = now
-                    proportional, resident = process_tree_memory(browser.pid)
-                    peak_proportional = max(peak_proportional, proportional)
-                    peak_resident = max(peak_resident, resident)
-                waited = now - started
-                if browser.poll() is not None:
-                    sys.exit(
-                        f"Browser test FAILED: the browser exited "
-                        f"{browser.returncode} after {waited:.0f}s without "
-                        f"reporting a result. Its last output, from "
-                        f"{chrome_log}:\n{chrome_log_tail(chrome_log)}"
-                    )
-                if waited > BROWSER_TEST_TIMEOUT_SECONDS:
-                    sys.exit(
-                        f"Browser test FAILED: no result after "
-                        f"{BROWSER_TEST_TIMEOUT_SECONDS}s. The page logs above "
-                        f"show the last stage it reached; the browser's last "
-                        f"output, from {chrome_log}:\n"
-                        f"{chrome_log_tail(chrome_log)}"
-                    )
+            report = wait_for_browser_result(
+                browser, results, sampler, started, chrome_log
+            )
         finally:
             browser.terminate()
             try:
@@ -1553,8 +1612,9 @@ def run_browser_test_phase(
     print(output)
     print(
         f"==> Browser run took {elapsed:.0f}s; peak browser memory "
-        f"{peak_proportional / 1e9:.1f} GB proportional, "
-        f"{peak_resident / 1e9:.1f} GB summed resident"
+        f"{sampler.peak_proportional / 1e9:.1f} GB proportional, "
+        f"{sampler.peak_resident / 1e9:.1f} GB summed resident, "
+        f"from {sampler.samples} samples costing {sampler.cost:.1f}s of the run"
     )
 
     if not report.get("ok"):
