@@ -25,11 +25,15 @@ import csv
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import queue
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -330,7 +334,7 @@ class MemorySamplerTest(unittest.TestCase):
         """The maximum can fall anywhere in the run — interior for a wheel big
         enough that unlinking the archive matters — so a later, smaller
         reading must not replace it."""
-        sampler = build_wasm.MemorySampler(os.getpid())
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
         readings = [(6_000_000_000, 6_300_000_000), (1_000, 2_000)]
         with mock.patch.object(
             build_wasm, "process_tree_memory", side_effect=readings
@@ -344,7 +348,7 @@ class MemorySamplerTest(unittest.TestCase):
     def test_adds_up_what_the_samples_cost(self):
         """The phase prints this, because it grows with the memory measured and
         is the perturbation the figure carries."""
-        sampler = build_wasm.MemorySampler(os.getpid())
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
 
         def slow_reading(pid):
             time.sleep(0.05)
@@ -355,15 +359,226 @@ class MemorySamplerTest(unittest.TestCase):
             sampler.sample()
         self.assertGreaterEqual(sampler.cost, 0.1)
 
+    def test_charges_readings_to_the_stage_the_page_reached(self):
+        """A stage's peak covers the polls taken while the page worked towards
+        it, plus the boundary reading `reached` takes on arrival."""
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
+        readings = [
+            (1_000, 1_100),  # polled while the wheel streamed in
+            (9_000, 9_100),  # polled again, still streaming
+            (8_000, 8_100),  # the boundary reading at wheel-fetched
+            (3_000, 3_100),  # polled while micropip unpacked
+            (7_000, 7_100),  # the boundary reading at wheel-installed
+        ]
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", side_effect=readings
+        ):
+            sampler.sample()
+            sampler.sample()
+            sampler.reached("wheel-fetched")
+            sampler.sample()
+            sampler.reached("wheel-installed")
+        self.assertEqual(
+            {name: (p.proportional, p.resident) for name, p in sampler.peaks.items()},
+            {
+                "wheel-fetched": (9_000, 9_100),
+                "wheel-installed": (7_000, 7_100),
+            },
+        )
+
+    def test_a_stage_does_not_inherit_the_peak_of_an_earlier_one(self):
+        """Attributing the run is the point, so a stage reports what it cost
+        and not the high-water mark of everything before it — while the
+        headline figure stays the largest reading of the whole run."""
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
+        readings = [(6_000_000_000, 6_300_000_000), (1_000_000_000, 1_100_000_000)]
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", side_effect=readings
+        ):
+            sampler.reached("wheel-installed")
+            sampler.reached("pyrosetta-imported")
+        imported = sampler.peaks["pyrosetta-imported"]
+        self.assertEqual(
+            (imported.proportional, imported.resident),
+            (1_000_000_000, 1_100_000_000),
+        )
+        self.assertEqual(sampler.peak_proportional, 6_000_000_000)
+        self.assertEqual(sampler.peak_resident, 6_300_000_000)
+
+    def test_times_a_stage_from_when_the_browser_was_launched(self):
+        """The page's marks are relative to its own script starting, which is
+        after however long the browser took to get there — so the table's one
+        time column has to come from the harness's clock instead."""
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic() - 12.0)
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", lambda pid: (1, 1)
+        ):
+            sampler.reached("pyodide-booted")
+        self.assertAlmostEqual(
+            sampler.peaks["pyodide-booted"].seconds, 12.0, places=1
+        )
+
+    def test_counts_a_reading_taken_after_the_last_stage(self):
+        """The headline peak is the largest of everything sampled, whether or
+        not a stage has closed over it yet."""
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
+        readings = [(1_000, 1_100), (5_000, 5_100)]
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", side_effect=readings
+        ):
+            sampler.reached("wheel-fetched")
+            sampler.sample()
+        fetched = sampler.peaks["wheel-fetched"]
+        self.assertEqual(list(sampler.peaks), ["wheel-fetched"])
+        self.assertEqual((fetched.proportional, fetched.resident), (1_000, 1_100))
+        self.assertEqual(sampler.peak_proportional, 5_000)
+        self.assertEqual(sampler.peak_resident, 5_100)
+
     def test_reads_the_memory_of_a_real_process_tree(self):
         """No mock: this exercises /proc against the interpreter running the
         test, which is the only process tree a unit test can count on."""
-        sampler = build_wasm.MemorySampler(os.getpid())
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
         sampler.sample()
         # A CPython process holds megabytes, so this is well clear of the zero
         # that a /proc read gone wrong would report.
         self.assertGreater(sampler.peak_proportional, 1_000_000)
         self.assertGreater(sampler.peak_resident, 1_000_000)
+
+
+class BrowserTestHandlerTest(unittest.TestCase):
+    """What the handler lets onto the results queue.
+
+    `wait_for_browser_result` tells a stage name from a verdict by type, and
+    that is only sound because nothing but a JSON object can reach the queue.
+    Nothing states that rule directly — it falls out of the token check, which
+    was written for a different purpose — so it is pinned here.
+    """
+
+    TOKEN = "the-run-token"
+
+    def setUp(self):
+        self.results = queue.Queue()
+        server = build_wasm.BrowserTestServer(
+            b"<!doctype html>",
+            Path("/nonexistent"),
+            Path("/nonexistent/wheel.whl"),
+            self.TOKEN,
+            self.results,
+        )
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def post(self, path, payload):
+        request = urllib.request.Request(
+            self.url + path,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status
+        except urllib.error.HTTPError as refused:
+            return refused.code
+
+    def test_a_mark_reaches_the_queue_as_text(self):
+        status = self.post(
+            "/mark", {"token": self.TOKEN, "name": "wheel-fetched", "detail": {}}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.results.get_nowait(), "wheel-fetched")
+
+    def test_a_verdict_reaches_the_queue_as_an_object(self):
+        status = self.post(
+            "/result", {"token": self.TOKEN, "ok": True, "marks": []}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            self.results.get_nowait(), {"token": self.TOKEN, "ok": True, "marks": []}
+        )
+
+    def test_a_payload_that_is_not_an_object_never_reaches_the_queue(self):
+        """This is the invariant the poll loop's type test depends on: a bare
+        JSON string posted to /result would otherwise read as a stage name and
+        the run would never end."""
+        for payload in ["just a string", ["a", "b"], 42, None]:
+            with self.subTest(payload=payload):
+                self.assertEqual(self.post("/result", payload), 403)
+        self.assertTrue(self.results.empty())
+
+    def test_a_wrong_token_never_reaches_the_queue(self):
+        self.assertEqual(
+            self.post("/result", {"token": "wrong", "ok": True}), 403
+        )
+        self.assertEqual(
+            self.post("/mark", {"token": "wrong", "name": "wheel-fetched"}), 403
+        )
+        self.assertTrue(self.results.empty())
+
+
+class AlwaysMarks:
+    """A results queue that hands back a stage name and never runs dry.
+
+    Stands in for a page that marks faster than the poll interval — which no
+    page does today, but `fetchWheelIntoFilesystem` already logs once per
+    250 MB, so a mark in that loop is one edit away.
+
+    Bounded, because the loop it feeds has no other way out: left unbounded, a
+    regression would hang the suite rather than fail it, exactly when the test
+    is doing its job."""
+
+    def __init__(self, patience: int = 10_000) -> None:
+        self.patience = patience
+
+    def get(self, timeout: float) -> str:
+        self.patience -= 1
+        if self.patience < 0:
+            raise AssertionError(
+                "wait_for_browser_result took 10,000 stage names without "
+                "checking the browser or the clock: the guards are reachable "
+                "only when a poll times out"
+            )
+        return "wheel-fetched"
+
+
+class PrintableTest(unittest.TestCase):
+    """What the harness will put in a build log on the page's say-so."""
+
+    def test_escapes_control_characters(self):
+        """A traceback carrying an escape sequence would otherwise rewrite the
+        terminal around the line it is printed on."""
+        self.assertEqual(
+            build_wasm.BrowserTestHandler.printable("a\x1b[2Jb\n"),
+            "a\\x1b[2Jb\\x0a",
+        )
+
+    def test_truncates_at_the_limit_it_is_given(self):
+        """A stage name becomes a column in the summary table, so it passes a
+        tight limit; a log message keeps the generous default, because a
+        truncated traceback is the one the phase most needs whole."""
+        self.assertEqual(
+            build_wasm.BrowserTestHandler.printable("x" * 500, limit=64),
+            "x" * 64,
+        )
+        self.assertEqual(
+            build_wasm.BrowserTestHandler.printable("x" * 500), "x" * 500
+        )
+
+    def test_blanks_a_run_token(self):
+        """The page's URL carries the run token and a stack trace names the
+        document it threw in, so a message from the page can quote it into a
+        build log."""
+        message = "at run (http://127.0.0.1:41234/?wheel=w.whl&token=SEKRIT:9)"
+        printed = build_wasm.BrowserTestHandler.printable(message)
+        self.assertNotIn("SEKRIT", printed)
+        self.assertIn("token=<redacted>", printed)
+
+    def test_renders_a_value_that_is_not_text(self):
+        """`json.loads` will hand back whatever the page posted, and a missing
+        key arrives as None."""
+        self.assertEqual(build_wasm.BrowserTestHandler.printable(None), "None")
 
 
 class WaitForBrowserResultTest(unittest.TestCase):
@@ -376,7 +591,7 @@ class WaitForBrowserResultTest(unittest.TestCase):
         the one sample taken here is the final one and nothing else."""
         results = queue.Queue()
         results.put({"ok": True})
-        sampler = build_wasm.MemorySampler(os.getpid())
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
         with mock.patch.object(
             build_wasm, "process_tree_memory", lambda pid: (7, 9)
         ):
@@ -392,7 +607,7 @@ class WaitForBrowserResultTest(unittest.TestCase):
         self.assertEqual(sampler.peak_proportional, 7)
 
     def test_samples_on_every_poll_it_waits_out(self):
-        sampler = build_wasm.MemorySampler(os.getpid())
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
         with mock.patch.object(
             build_wasm, "process_tree_memory", lambda pid: (1, 1)
         ):
@@ -405,8 +620,67 @@ class WaitForBrowserResultTest(unittest.TestCase):
             )
         self.assertEqual(sampler.samples, 4, "three polls, then the verdict")
 
+    def test_a_stage_name_is_not_a_verdict_and_does_not_end_the_wait(self):
+        """The page posts stage names and its verdict on the same queue, so the
+        loop has to keep waiting through the names and group by them."""
+        results = queue.Queue()
+        results.put("wheel-fetched")
+        results.put("wheel-installed")
+        results.put({"ok": True, "marks": []})
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", side_effect=[(1, 1), (2, 2), (3, 3)]
+        ):
+            report = build_wasm.wait_for_browser_result(
+                FakeBrowser(os.getpid()),
+                results,
+                sampler,
+                time.monotonic(),
+                self.MISSING_LOG,
+            )
+        self.assertEqual(report, {"ok": True, "marks": []})
+        self.assertEqual(
+            list(sampler.peaks), ["wheel-fetched", "wheel-installed", "verdict"]
+        )
+
+    def test_a_stream_of_stage_names_does_not_starve_the_timeout(self):
+        """Stage names and the verdict share a queue, so a page that marks
+        without pause never leaves the loop through `queue.Empty`. The timeout
+        must not be reachable only on that path."""
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
+        overran = time.monotonic() - build_wasm.BROWSER_TEST_TIMEOUT_SECONDS - 1
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", lambda pid: (1, 1)
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                build_wasm.wait_for_browser_result(
+                    FakeBrowser(os.getpid()),
+                    AlwaysMarks(),
+                    sampler,
+                    overran,
+                    self.MISSING_LOG,
+                )
+        self.assertIn("no result after", str(raised.exception))
+
+    def test_a_stream_of_stage_names_does_not_hide_a_dead_browser(self):
+        """The same path guards the other check: a browser that died still has
+        to be noticed while marks are arriving."""
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
+        with mock.patch.object(
+            build_wasm, "process_tree_memory", lambda pid: (1, 1)
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                build_wasm.wait_for_browser_result(
+                    FakeBrowser(os.getpid(), returncode=9),
+                    AlwaysMarks(),
+                    sampler,
+                    time.monotonic(),
+                    self.MISSING_LOG,
+                )
+        self.assertIn("the browser exited 9", str(raised.exception))
+
     def test_a_browser_that_exits_without_reporting_fails_the_phase(self):
-        sampler = build_wasm.MemorySampler(os.getpid())
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
         with mock.patch.object(
             build_wasm, "process_tree_memory", lambda pid: (1, 1)
         ):
@@ -421,7 +695,7 @@ class WaitForBrowserResultTest(unittest.TestCase):
         self.assertIn("the browser exited 9", str(raised.exception))
 
     def test_a_run_past_the_timeout_fails_the_phase(self):
-        sampler = build_wasm.MemorySampler(os.getpid())
+        sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
         overran = time.monotonic() - build_wasm.BROWSER_TEST_TIMEOUT_SECONDS - 1
         with mock.patch.object(
             build_wasm, "process_tree_memory", lambda pid: (1, 1)

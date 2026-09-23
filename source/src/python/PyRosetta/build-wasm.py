@@ -76,6 +76,7 @@ import urllib.request
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
 # Pinned toolchain versions (see ADR 0001 section 1).
@@ -1264,6 +1265,20 @@ def process_tree_memory(pid: int) -> tuple[int, int]:
     return proportional_total, resident_total
 
 
+class StagePeak(NamedTuple):
+    """The largest the browser got while the page worked towards one stage.
+
+    ``seconds`` is on the harness's clock, which starts when the browser is
+    launched. The page's own marks are relative to the moment its script began
+    running, so they say nothing about how long the browser took to get there,
+    which against a fresh profile has been measured at 75 s — most of that
+    run."""
+
+    seconds: float
+    proportional: int
+    resident: int
+
+
 class MemorySampler:
     """Peak memory of the browser process tree, sampled while the page works.
 
@@ -1277,12 +1292,25 @@ class MemorySampler:
     tab about that much back before PyRosetta starts, and 0031 attributed the
     9.8 GB peak of the 966 MB wheel to that unpack. So the peak is taken from
     a sample on every poll, plus one more when the verdict arrives.
+
+    One number for the whole run says the wheel is out of reach of a laptop
+    without saying which part of the run to attack, and the parts cost very
+    different amounts, so the readings are also grouped: the page announces
+    each stage as it reaches it, and ``reached`` charges everything sampled
+    since the previous announcement to the stage just finished. What that
+    reports is therefore the largest the browser got at any point while
+    working towards that stage — which for a stretch that only allocates is
+    what it held on arriving, and for one that frees more than it takes is
+    what it held on starting.
     """
 
-    def __init__(self, pid: int) -> None:
+    def __init__(self, pid: int, started: float) -> None:
         self.pid = pid
-        self.peak_proportional = 0
-        self.peak_resident = 0
+        self.started = started
+        # Stage name -> peak, in the order the page reached them, which is the
+        # order the phase reports them in.
+        self.peaks: dict[str, StagePeak] = {}
+        self.pending = (0, 0)
         self.samples = 0
         self.cost = 0.0
 
@@ -1295,9 +1323,35 @@ class MemorySampler:
         started = time.monotonic()
         proportional, resident = process_tree_memory(self.pid)
         self.cost += time.monotonic() - started
-        self.peak_proportional = max(self.peak_proportional, proportional)
-        self.peak_resident = max(self.peak_resident, resident)
+        pending_proportional, pending_resident = self.pending
+        self.pending = (
+            max(pending_proportional, proportional),
+            max(pending_resident, resident),
+        )
         self.samples += 1
+
+    def reached(self, stage: str) -> None:
+        """Charge everything sampled since the last stage to this one.
+
+        The boundary reading is taken here rather than left to the next poll
+        because a poll is a second away and against the core wheel a second is
+        worth 0.4 GB — it would land in the following stage and read as that
+        stage's cost."""
+        self.sample()
+        self.peaks[stage] = StagePeak(
+            time.monotonic() - self.started, *self.pending
+        )
+        self.pending = (0, 0)
+
+    @property
+    def peak_proportional(self) -> int:
+        recorded = [peak.proportional for peak in self.peaks.values()]
+        return max([*recorded, self.pending[0]], default=0)
+
+    @property
+    def peak_resident(self) -> int:
+        recorded = [peak.resident for peak in self.peaks.values()]
+        return max([*recorded, self.pending[1]], default=0)
 
 
 def write_private_file(path: Path, text: str) -> None:
@@ -1396,13 +1450,42 @@ class BrowserTestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/log":
-            print(f"    [page] {payload.get('message', '')}", flush=True)
+            message = self.printable(payload.get("message", ""))
+            print(f"    [page] {message}", flush=True)
+        elif path == "/mark":
+            # A stage name goes on the same queue as the verdict: the queue is
+            # what the poll loop is already waiting on, so putting the mark
+            # there wakes it at the boundary instead of up to a poll later.
+            stage = self.printable(payload.get("name", "?"), limit=64)
+            detail = self.printable(payload.get("detail", ""))
+            print(f"    [page] --- {stage} {detail}", flush=True)
+            self.server.results.put(stage)
         elif path == "/result":
             self.server.results.put(payload)
         else:
             self.send_bytes(b"not found\n", "text/plain", status=404)
             return
         self.send_bytes(b"", "text/plain")
+
+    @staticmethod
+    def printable(value: object, limit: int = 2000) -> str:
+        """Text from the page, made safe to print into a build log.
+
+        The page is served by this harness and its POSTs carry the run token,
+        so the escaping is not guarding against an attacker so much as against
+        a traceback full of control characters rewriting the terminal around
+        it. The default limit is generous for that reason — a truncated
+        traceback is the one the phase most needs whole. A stage name passes a
+        tight limit instead, since it becomes a column in the summary table.
+
+        The page's own URL carries the run token, and a stack trace naming the
+        document quotes it, so this redacts as every other print of a URL in
+        this file does. Redaction runs before truncation because that order
+        stays correct if ``redact_token``'s pattern is ever made less greedy;
+        today's pattern runs to the end of the string, so either order blanks
+        a token the cut lands inside."""
+        redacted = redact_token(str(value))
+        return redacted[:limit].translate(CONTROL_CHARACTER_ESCAPES)
 
     def serve_pyodide_file(self, name: str) -> None:
         if not servable_name(name):
@@ -1458,20 +1541,25 @@ def wait_for_browser_result(
     """Wait for the page to post its verdict, sampling memory as it works.
 
     The poll period doubles as the sampling period — see
-    ``BROWSER_POLL_INTERVAL_SECONDS``. One more sample is taken once the
-    verdict is in hand: it arrives at the instant PyRosetta finishes
-    initialising, which no poll lands on, and against the core wheel that is
-    the largest the browser ever gets.
+    ``BROWSER_POLL_INTERVAL_SECONDS``. The page also posts the name of each
+    stage as it reaches it, which arrives on the same queue and groups the
+    readings taken so far under that name.
+
+    A last reading is taken once the verdict is in hand, under the name
+    ``verdict``: for a run that ends the instant PyRosetta finishes
+    initialising it repeats the boundary the previous stage already took, but
+    for one that fails it is the only reading covering whatever the page did
+    after the last stage it reached.
 
     Exits rather than returning if the browser dies or the run overruns, since
     neither leaves a verdict to report."""
     while True:
-        try:
-            report = results.get(timeout=BROWSER_POLL_INTERVAL_SECONDS)
-            break
-        except queue.Empty:
-            pass
-        sampler.sample()
+        # Both guards run every time round, before anything else. They used to
+        # sit after the queue read, on the path a poll that timed out took —
+        # which meant a page marking faster than the poll interval would keep
+        # this loop alive past a dead browser and past the timeout. Today's
+        # page marks seven times, but `fetchWheelIntoFilesystem` already logs
+        # once per 250 MB, so a mark in that loop is one edit away.
         waited = time.monotonic() - started
         if browser.poll() is not None:
             sys.exit(
@@ -1488,7 +1576,18 @@ def wait_for_browser_result(
                 f"output, from {chrome_log}:\n"
                 f"{chrome_log_tail(chrome_log)}"
             )
-    sampler.sample()
+        try:
+            report = results.get(timeout=BROWSER_POLL_INTERVAL_SECONDS)
+        except queue.Empty:
+            sampler.sample()
+            continue
+        # The page posts a stage name as a bare string and its verdict as an
+        # object, and the handler rejects a payload that is not an object
+        # before it ever reaches this queue — so the type says which is which.
+        if not isinstance(report, str):
+            break
+        sampler.reached(report)
+    sampler.reached("verdict")
     return report
 
 
@@ -1589,7 +1688,7 @@ def run_browser_test_phase(
     started = time.monotonic()
     with open(chrome_log, "w", encoding="utf-8") as log_file:
         browser = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT)
-        sampler = MemorySampler(browser.pid)
+        sampler = MemorySampler(browser.pid, started)
         try:
             report = wait_for_browser_result(
                 browser, results, sampler, started, chrome_log
@@ -1605,9 +1704,24 @@ def run_browser_test_phase(
             launch_page.unlink(missing_ok=True)
 
     elapsed = time.monotonic() - started
-    for stage in report.get("marks", []):
-        detail = {k: v for k, v in stage.items() if k not in ("name", "seconds")}
-        print(f"    {stage.get('seconds', 0):7.1f}s  {stage.get('name', '?')}  {detail}")
+    # The sampler holds the stages, because it is what measured them; the
+    # page's own marks carry the clock reading and the wasm heap at each.
+    marks = {
+        str(m.get("name")): m
+        for m in report.get("marks", [])
+        if isinstance(m, dict)
+    }
+    print(f"    {'at':>8}  {'peak':>7}  stage")
+    for stage, peak in sampler.peaks.items():
+        mark = marks.get(stage, {})
+        detail = {k: v for k, v in mark.items() if k not in ("name", "seconds")}
+        described = (
+            "  " + BrowserTestHandler.printable(detail) if detail else ""
+        )
+        print(
+            f"    {peak.seconds:7.1f}s  {peak.proportional / 1e9:4.1f} GB  "
+            f"{stage}{described}"
+        )
     output = report.get("output", "")
     print(output)
     print(
