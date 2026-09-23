@@ -157,6 +157,63 @@ class CoreDatabaseKeepsTest(unittest.TestCase):
     def test_keeps_a_path_that_only_shares_a_prefix_with_a_dropped_subtree(self):
         self.assertTrue(build_wasm.core_database_keeps("scoring/rnase_notreal/x.txt"))
 
+    def test_drops_the_score_terms_outside_core_modelling(self):
+        """The second pass, inside scoring/score_functions. Every one of these
+        is reached only when something outside core protein modelling asks for
+        it, and every one fails by naming the file it could not open."""
+        for path in [
+            "scoring/score_functions/goap/angle_table.dat.gz",
+            "scoring/score_functions/mhc_epitope/iedb_data.db",
+            "scoring/score_functions/rama/Rama08.dat",
+            "scoring/score_functions/rama/aramid/KAA_rama.txt",
+            "scoring/score_functions/rama/beta_aa/B3A.rama",
+            "scoring/score_functions/rama/oligourea/OU3_ALA_rama.txt",
+        ]:
+            with self.subTest(path=path):
+                self.assertFalse(build_wasm.core_database_keeps(path))
+
+    def test_drops_the_two_bead_etables(self):
+        """No code reads these: no option default names them, and the only
+        mention in the tree is a line in source/src/utility/file_list, a
+        manifest nothing consumes."""
+        self.assertFalse(
+            build_wasm.core_database_keeps(
+                "scoring/score_functions/etable/etable.twobead.lj.dat"
+            )
+        )
+
+    def test_drops_the_finer_p_aa_pp_propensity_grid(self):
+        self.assertFalse(
+            build_wasm.core_database_keeps(
+                "scoring/score_functions/P_AA_pp/shapovalov/2.5deg/kappa50/a20.prop"
+            )
+        )
+
+    def test_keeps_both_p_aa_pp_smoothing_levels_a_flag_can_select(self):
+        """score_function_corrections.cc:676,679 sets shap_p_aa_pp to kappa131
+        for -shap_p_aa_pp_smooth_level 1 and kappa50 for 2, both under 10deg/.
+        Level 1 is the default (options_rosetta.py:2811), so kappa131 is what
+        a default-flags run actually reads."""
+        for kappa in ["kappa50", "kappa131"]:
+            with self.subTest(kappa=kappa):
+                self.assertTrue(
+                    build_wasm.core_database_keeps(
+                        "scoring/score_functions/P_AA_pp/shapovalov/10deg/"
+                        f"{kappa}/a20.prop"
+                    )
+                )
+
+    def test_keeps_the_rama_maps_a_default_run_reads(self):
+        """rama/Rama08.dat is dropped by exact name, so this pins that it does
+        not reach the default rama_map or shap_rama_map beside it. The
+        rotamer/shapovalov/ special case is a different tree from this one."""
+        for path in [
+            "scoring/score_functions/rama/Rama_smooth_dyn.dat_ss_6.4",
+            "scoring/score_functions/rama/shapovalov/kappa25/all.ramaProb",
+        ]:
+            with self.subTest(path=path):
+                self.assertTrue(build_wasm.core_database_keeps(path))
+
 
 def build_wheel(path: Path, entries: dict[str, bytes], with_record: bool = True) -> None:
     """Write a minimal wheel holding exactly ``entries``."""

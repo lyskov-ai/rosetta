@@ -30,7 +30,7 @@ Pipeline:
    ``setup.py``. The wheel post-processor renames the ``.so`` to
    carry the Pyodide ABI tag. The wheel is then rewritten without the
    database subtrees outside core protein modelling, which takes it
-   from about 964 MB to about 172 MB; ``--database full`` keeps it
+   from about 964 MB to about 106 MB; ``--database full`` keeps it
    whole. Skipped by ``--skip-pyodide-build-phase``.
 4. Phase 4 — test: install the wheel into a throwaway ``pyodide venv``
    and assert that ``import pyrosetta; pyrosetta.init()`` prints the
@@ -843,6 +843,15 @@ def run_pyodide_build_phase(
 #     correction, and `score_function_corrections.cc:1971` points `dun10_dir`
 #     at `rotamer/beta_nov2016` when it is passed, so that stays too.
 #
+# A second pass goes inside `scoring/score_functions`, which the first left
+# whole: it is 91.7 MB of the 135 MB that survives, and a traced core workload
+# reads 0.85 MB of it. Its subtrees are named score terms rather than protocol
+# families, so each drop was checked against the code that reads it rather than
+# against the trace. None of them repeats the `sasa.cc` pattern. Every one
+# reaches its file through `basic::database::open`, which throws naming it, or
+# through an explicit `good()` test and `utility_exit_with_message` — except
+# the two-bead etables, which nothing in `source/src` reads at all.
+#
 # The rule is deliberately coarser than the 896 files a traced run actually
 # reads, and costs about 130 MB more than they would. A list derived from one
 # trace would leave the first protocol that stepped outside it failing at
@@ -871,6 +880,16 @@ CORE_DATABASE_DROPPED_SUBTREES = (
     "scoring/loop_close/",           # KIC loop-closure statistics
     "scoring/qsar/",
     "scoring/rna/",
+    "scoring/score_functions/goap/",          # the GOAP score function, named
+                                              # by no weights file in the tree
+    "scoring/score_functions/mhc_epitope/",   # deimmunisation: the IEDB
+                                              # database and its .mhc setups
+    # The three non-canonical backbone rama tables. A .params file names one in
+    # RAMA_PREPRO_FILENAME and RamaPrePro loads it only when such a residue is
+    # scored; the canonical twenty come from rama/fd/, which stays.
+    "scoring/score_functions/rama/aramid/",
+    "scoring/score_functions/rama/beta_aa/",
+    "scoring/score_functions/rama/oligourea/",
     "sequence/genome_9mers/",
     "sequence/mhc_",                 # mhc_pssms, mhc_rank_svm_scores, mhc_svms
     "sequence/tcell_ep_9mers/",
@@ -880,6 +899,20 @@ CORE_DATABASE_DROPPED_SUBTREES = (
     "rotamer/bbdep02.May.sortlib",   # the 2002 Dunbrack library, both copies
     "rotamer/cenrot_dunbrack.lib",   # centroid rotamers, -score:cenrot
     "rotamer/corrections_conway2016/",
+    "scoring/score_functions/P_AA_pp/shapovalov/2.5deg/",
+                                     # the finer propensity grid; both smoothing
+                                     # levels -shap_p_aa_pp_smooth_level can
+                                     # select are under 10deg/
+    "scoring/score_functions/rama/Rama08.dat",
+                                     # -in:file:rama2b_map. The rama2b score
+                                     # term is named by no shipped weights
+                                     # file, and the table's other callers are
+                                     # loop closure: KIC's perturbers, and CCD
+                                     # behind -loops:ccd:rama_2b, off by
+                                     # default
+    # Read by nothing in the tree.
+    "scoring/score_functions/etable/",  # the two-bead etables: no source file
+                                        # names them and no option default does
 )
 
 # rotamer/shapovalov/ carries the 2010 Dunbrack library at six smoothing
@@ -1798,7 +1831,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="How much of the Rosetta database the wheel carries. 'core' "
              "(the default) leaves out the database subtrees outside core "
              "protein modelling, taking the wheel from about 964 MB to "
-             "about 172 MB; 'full' ships it whole. Applied to the wheel the "
+             "about 106 MB; 'full' ships it whole. Applied to the wheel the "
              "package phase produces, so it does nothing under "
              "--skip-pyodide-build-phase.",
     )
