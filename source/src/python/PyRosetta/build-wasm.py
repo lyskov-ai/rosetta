@@ -39,6 +39,13 @@ Pipeline:
    loopback, load them in a pinned ``chrome-headless-shell``, and assert
    the same banner against what PyRosetta prints inside the browser.
    Run only with ``--browser-test``.
+6. Phase 6 — JupyterLite site: build a static site under the build root
+   that runs PyRosetta in a notebook entirely in the browser (M2), with
+   the wheel and an example notebook. Run only with ``--jupyterlite``.
+7. Phase 7 — notebook test: run the site's example notebook through the
+   site's own Pyodide kernel under Node, and assert that every cell
+   succeeds and prints the M1 banner. M2's CI gate. Run only with
+   ``--jupyterlite-test``, which implies ``--jupyterlite``.
 
 Host prerequisites:
     - git, curl, bash
@@ -55,6 +62,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import functools
 import hashlib
 import html
 import io
@@ -74,13 +82,20 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import (
+    BaseHTTPRequestHandler,
+    SimpleHTTPRequestHandler,
+    ThreadingHTTPServer,
+)
 from pathlib import Path
-from typing import NamedTuple
+from typing import Mapping, NamedTuple
 
 # ---------------------------------------------------------------------------
 # Pinned toolchain versions (see ADR 0001 section 1).
 # ---------------------------------------------------------------------------
+# Bump together with the Pyodide kernel in wasm_jupyterlite_requirements.txt:
+# each kernel release line targets one Pyodide release line, and the notebook
+# test runs the site's kernel on this release (ADR 0006).
 PYODIDE_VERSION = "0.29.4"
 PYTHON_MINOR = "3.13"  # Pyodide 0.29.4 ships CPython 3.13.2 internally.
 EMSDK_VERSION = "4.0.9"
@@ -118,6 +133,19 @@ CHROME_SHA256 = "944dc1eae654637fed4d57650198774f9c43b45f34e48febb84f43c541b5de7
 CHROME_RELEASE_URL = (
     "https://storage.googleapis.com/chrome-for-testing-public/{ver}/"
     "linux64/chrome-headless-shell-linux64.zip"
+)
+
+# The one package the Pyodide kernel installs at start-up that neither Pyodide's
+# lockfile nor the kernel's own wheel index carries. Left alone, piplite would
+# fetch whatever release is newest on PyPI at every kernel start — in the
+# notebook test, and in every visitor's browser. The site ships this copy
+# instead, so the kernel finds it in the site's own index (ADR 0006). The digest
+# is PyPI's, recorded here and verified on download.
+COMM_WHEEL = "comm-0.2.3-py3-none-any.whl"
+COMM_WHEEL_SHA256 = "c615d91d75f7f04f095b30d1c1711babd43bdc6419c1be9886a85f2f4e489417"
+COMM_WHEEL_URL = (
+    "https://files.pythonhosted.org/packages/60/97/"
+    "891a0971e1e4a8c5d2b20bbe0e524dc04548d2307fee33cdeba148fd4fc7/" + COMM_WHEEL
 )
 
 
@@ -527,6 +555,84 @@ def install_chrome_headless_shell(
     archive.unlink()
     write_signature(signature_file, signature)
     return chrome_bin
+
+
+def install_jupyterlite_env(
+    prefix_root: Path, python_minor: str = PYTHON_MINOR
+) -> tuple[Path, Path]:
+    """Create the venv that builds the JupyterLite site, at
+    <prefix_root>/jupyterlite/venv/, and fetch the pinned ``comm`` wheel the
+    site ships beside it. Returns ``(venv bin/ directory, comm wheel)``.
+
+    The versions live in wasm_jupyterlite_requirements.txt, which pins the
+    whole dependency closure with hashes, so the signature records that file's
+    digest rather than a version: editing it is what triggers a reinstall.
+    ``--no-build`` keeps the hashes meaningful: every entry also lists its
+    sdist's digest, and building one would fetch a build backend the lock does
+    not pin.
+
+    Only the JupyterLite phases call this, so an ordinary build never pays for
+    it."""
+    uv_bin = install_uv(prefix_root)
+    requirements = script_dir() / "wasm_jupyterlite_requirements.txt"
+    install_dir = prefix_root / "jupyterlite"
+    venv_dir = install_dir / "venv"
+    venv_bin = venv_dir / "bin"
+    comm_wheel = install_dir / COMM_WHEEL
+    signature_file = install_dir / ".signature.json"
+    signature = {
+        "tool": "jupyterlite",
+        "python_minor": python_minor,
+        "uv_version": UV_VERSION,
+        "requirements_sha256": sha256_of(requirements),
+        "comm_wheel_sha256": COMM_WHEEL_SHA256,
+    }
+
+    if (
+        signature_matches(signature_file, signature)
+        and (venv_bin / "jupyter-lite").is_file()
+        and comm_wheel.is_file()
+    ):
+        print(f"JupyterLite already installed at {install_dir}")
+        return venv_bin, comm_wheel
+
+    if install_dir.exists():
+        shutil.rmtree(install_dir)
+    install_dir.mkdir(parents=True)
+
+    execute(
+        f"Creating venv with Python {python_minor} (uv-managed)",
+        str(uv_bin),
+        "venv",
+        "--python",
+        python_minor,
+        str(venv_dir),
+    )
+    execute(
+        f"Installing JupyterLite from {requirements.name}",
+        str(uv_bin),
+        "pip",
+        "install",
+        "--python",
+        str(venv_bin / "python"),
+        "--require-hashes",
+        "--no-build",
+        "--requirement",
+        str(requirements),
+    )
+
+    download(COMM_WHEEL_URL, comm_wheel)
+    actual_sha = sha256_of(comm_wheel)
+    if actual_sha != COMM_WHEEL_SHA256:
+        sys.exit(
+            f"SHA256 mismatch for {COMM_WHEEL}:\n"
+            f"  expected: {COMM_WHEEL_SHA256}\n"
+            f"  actual:   {actual_sha}"
+        )
+    print(f"==> SHA256 verified: {actual_sha}")
+
+    write_signature(signature_file, signature)
+    return venv_bin, comm_wheel
 
 
 def missing_chrome_libraries(chrome_bin: Path) -> list[str]:
@@ -1784,6 +1890,310 @@ def run_browser_test_phase(
 
 
 # ---------------------------------------------------------------------------
+# JupyterLite phases — build a static notebook site, and run its notebook
+# through the site's own kernel under Node.
+# ---------------------------------------------------------------------------
+# The name the example notebook has in the site's file browser.
+JUPYTERLITE_NOTEBOOK = "PyRosetta.ipynb"
+
+JUPYTERLITE_KERNEL_PLUGIN = "@jupyterlite/pyodide-kernel-extension:kernel"
+
+
+def jupyterlite_site_dir(build_type: str) -> Path:
+    """Where the JupyterLite site is built. Written by the site phase and
+    served by the notebook test, so both must agree on it."""
+    return build_root(build_type) / "jupyterlite"
+
+
+def jupyterlite_config() -> dict:
+    """The ``jupyter-lite.json`` the site is built from.
+
+    The one setting is which Pyodide the kernel runs. Left alone, kernel 0.7.2
+    loads Pyodide 0.29.3 from the CDN; this names the release the wheel was
+    built against, which is also the release whose runtime the notebook test
+    loads from the cross-build environment. ``jupyter lite build`` merges in
+    the wheel indexes it writes itself."""
+    return {
+        "jupyter-lite-schema-version": 0,
+        "jupyter-config-data": {
+            "litePluginSettings": {
+                JUPYTERLITE_KERNEL_PLUGIN: {
+                    "pyodideUrl": f"{PYODIDE_PACKAGE_CDN}/pyodide.js",
+                },
+            },
+        },
+    }
+
+
+def jupyterlite_build_env(host_env: Mapping[str, str]) -> dict[str, str]:
+    """The environment ``jupyter lite build`` runs in, with the host's say over
+    the site taken out.
+
+    Two channels are closed here. The build reads ``jupyter_lite_config``
+    files from every Jupyter config directory — ~/.jupyter, /etc/jupyter and
+    the like — and ``JUPYTER_NO_CONFIG`` is jupyter_core's switch for searching
+    none of them. And some build settings default to ``JUPYTERLITE_*``
+    variables: ``JUPYTERLITE_PYODIDE_URL`` alone would copy a Pyodide of its
+    choosing into the site and point the kernel at it. A third, ``PYTHONPATH``
+    and the rest of Python's own variables, which could add build addons or
+    shadow the pinned packages, is closed by running the build under
+    ``python -I`` instead."""
+    env = {
+        name: value
+        for name, value in host_env.items()
+        if not name.startswith("JUPYTERLITE_")
+    }
+    env["JUPYTER_NO_CONFIG"] = "1"
+    return env
+
+
+def run_jupyterlite_build_phase(
+    jupyterlite_venv_bin: Path,
+    comm_wheel: Path,
+    args: argparse.Namespace,
+    wheel: Path,
+) -> Path:
+    """Build a static JupyterLite site that runs PyRosetta in a notebook, and
+    return its directory.
+
+    The site is JupyterLab, the Pyodide kernel, the wheel indexed for the
+    kernel's ``%pip`` to install from, the pinned ``comm`` the kernel installs
+    at start-up, and the example notebook. Everything
+    runs in the visitor's browser; the Pyodide runtime itself comes from the
+    CDN, as numpy does for the other phases.
+
+    Both the source and output directories are rebuilt every run. The build
+    keeps a doit cache in its source directory, and a cache that outlives one
+    build can skip merging ``jupyter-lite.json`` into the next, which silently
+    drops the kernel's settings from the site."""
+    lite_dir = build_root(args.type) / "jupyterlite-src"
+    site = jupyterlite_site_dir(args.type)
+    for stale in (lite_dir, site):
+        if stale.exists():
+            shutil.rmtree(stale)
+
+    contents_dir = lite_dir / "files"
+    contents_dir.mkdir(parents=True)
+    (lite_dir / "jupyter-lite.json").write_text(
+        json.dumps(jupyterlite_config(), indent=2) + "\n", encoding="utf-8"
+    )
+    shutil.copyfile(
+        script_dir() / "wasm_jupyterlite_example.ipynb",
+        contents_dir / JUPYTERLITE_NOTEBOOK,
+    )
+
+    execute(
+        f"Building the JupyterLite site into {site}",
+        str(jupyterlite_venv_bin / "python"),
+        "-I",
+        "-m",
+        "jupyterlite_core",
+        "build",
+        "--lite-dir",
+        str(lite_dir),
+        "--contents",
+        str(contents_dir),
+        "--piplite-wheels",
+        str(wheel),
+        "--piplite-wheels",
+        str(comm_wheel),
+        "--output-dir",
+        str(site),
+        cwd=lite_dir,
+        env=jupyterlite_build_env(os.environ),
+    )
+    print(
+        f"JupyterLite site ready at {site}. To open it by hand, serve it over "
+        f"HTTP — `python3 -m http.server --bind 127.0.0.1 -d "
+        f"{shlex.quote(str(site))}` — and "
+        f"browse to lab/index.html?path={JUPYTERLITE_NOTEBOOK}"
+    )
+    return site
+
+
+class JupyterLiteSiteHandler(SimpleHTTPRequestHandler):
+    """Serves the built site to the notebook test, which fetches it the way a
+    browser would: configuration, wheel indexes, wheels, the notebook."""
+
+    def log_message(self, fmt: str, *fmt_args) -> None:
+        # A request line arrives from the network. Loopback narrows that to
+        # this host, not to this process.
+        line = (fmt % fmt_args).translate(CONTROL_CHARACTER_ESCAPES)
+        print(f"    [server] {line}", flush=True)
+
+
+# Colour codes, which IPython puts throughout a traceback.
+ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
+
+# CONTROL_CHARACTER_ESCAPES without newline and tab: a traceback is many lines.
+MULTILINE_ESCAPES = {
+    code: escaped
+    for code, escaped in CONTROL_CHARACTER_ESCAPES.items()
+    if code not in (0x09, 0x0A)
+}
+
+
+def notebook_report_failure(report: dict) -> str | None:
+    """Why a notebook run failed, or None if it passed.
+
+    A run passes when every code cell it ran succeeded and the cells' streams,
+    together, carry the M1 banner. The banner is asserted on the streams rather
+    than on the replay's own output because the streams are what a notebook
+    shows under a cell, and the banner reaches them by two paths. The box and
+    the ``PyRosetta-4`` line are a Python ``print``. The ``core.init:`` and
+    ``basic.random`` lines come from Rosetta's C++ tracer. In the kernel
+    ``pyrosetta._is_interactive()`` is True, since ``__main__`` has no
+    ``__file__``, so ``init()`` mutes the tracer's own stdout and routes it
+    through Python's ``logging`` to the cell's stdout instead. The muted path
+    is the one the worker would have sent to the browser console and
+    JupyterLab's log console, not to the cell. So the two tracer substrings are
+    what fail if that routing breaks.
+
+    A failing cell's traceback is code-controlled text headed for a build log,
+    so its colour codes are stripped and any other control character escaped,
+    as everything else this file prints from a run is."""
+    cells = report.get("cells", [])
+    for cell in cells:
+        if cell.get("status") != "ok":
+            traceback = "\n".join(cell.get("traceback") or [])
+            failure = (
+                f"cell {cell.get('id')} ended with status "
+                f"{cell.get('status')!r}: {cell.get('ename')}: "
+                f"{cell.get('evalue')}\n{traceback}"
+            )
+            return ANSI_SGR.sub("", failure).translate(MULTILINE_ESCAPES)
+    streamed = "".join(
+        output.get("text", "")
+        for cell in cells
+        for output in cell.get("outputs", [])
+        if output.get("output_type") == "stream"
+    )
+    missing = [s for s in SMOKE_TEST_REQUIRED_OUTPUT if s not in streamed]
+    if missing:
+        listed = "\n  ".join(repr(s) for s in missing)
+        return (
+            f"all {len(cells)} code cells succeeded, but {len(missing)} of the "
+            f"{len(SMOKE_TEST_REQUIRED_OUTPUT)} required substrings are absent "
+            f"from what they printed:\n  {listed}"
+        )
+    return None
+
+
+def run_jupyterlite_test_phase(
+    prefix_root: Path,
+    emsdk_env: Path,
+    args: argparse.Namespace,
+    site: Path,
+) -> None:
+    """Run the site's example notebook through the site's own kernel, under
+    Node, and assert that every cell succeeds and PyRosetta prints the M1
+    banner.
+
+    This is M2's CI gate. The kernel's Web Worker needs a browser, but it only
+    starts Pyodide and hands each cell to ``pyodide_kernel``, which needs
+    nothing a browser has. ``wasm_jupyterlite_test.mjs`` makes the worker's
+    calls in the worker's order, against the site served on loopback, so the
+    kernel installs itself and PyRosetta from the site's own wheel indexes, as
+    it does for a visitor. What it cannot cover is the worker's use of browser
+    APIs — the ``/drive`` file-browser mount, stdin, comms — which is T0043's
+    browser test."""
+    replay = script_dir() / "wasm_jupyterlite_test.mjs"
+    if not replay.is_file():
+        sys.exit(f"The notebook test script is missing at {replay}")
+
+    pyodide_dist = pyodide_browser_dist_dir(prefix_root)
+    if not (pyodide_dist / "pyodide.mjs").is_file():
+        sys.exit(
+            f"No Pyodide runtime at {pyodide_dist}. It ships inside the "
+            f"cross-build environment, which Phase 1 installs: delete "
+            f"{pyodide_build_install_dir(prefix_root)} and re-run to rebuild it."
+        )
+
+    # The replay loads the runtime from the cross-build environment in place of
+    # the one the site names, which is only a stand-in while the two are the
+    # same release. Checked on the built site, not on jupyterlite_config():
+    # the build is what decides what ships.
+    built = json.loads((site / "jupyter-lite.json").read_text(encoding="utf-8"))
+    site_pyodide = (
+        built["jupyter-config-data"]
+        .get("litePluginSettings", {})
+        .get(JUPYTERLITE_KERNEL_PLUGIN, {})
+        .get("pyodideUrl")
+    )
+    expected_pyodide = jupyterlite_config()["jupyter-config-data"][
+        "litePluginSettings"
+    ][JUPYTERLITE_KERNEL_PLUGIN]["pyodideUrl"]
+    if site_pyodide != expected_pyodide:
+        sys.exit(
+            f"Notebook test FAILED before it started: the site's kernel loads "
+            f"Pyodide from {site_pyodide!r}, but the test runs Pyodide "
+            f"{PYODIDE_VERSION} from {pyodide_dist} in its place, which "
+            f"stands in only for {expected_pyodide!r}."
+        )
+
+    # Pyodide under Node saves every package it downloads here. Emptied each
+    # run: Node reads a cached package back without checking its digest.
+    package_cache = build_root(args.type) / "jupyterlite-test-packages"
+    if package_cache.exists():
+        shutil.rmtree(package_cache)
+    package_cache.mkdir(parents=True)
+    report_file = build_root(args.type) / "jupyterlite-test-report.json"
+    report_file.unlink(missing_ok=True)
+
+    # Port 0 lets the OS pick a free port; loopback keeps the site off the
+    # network.
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        functools.partial(JupyterLiteSiteHandler, directory=str(site)),
+    )
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    site_url = f"http://127.0.0.1:{server.server_address[1]}/"
+
+    command = (
+        # See run_test_phase for why EMSDK_QUIET, and why emsdk's node.
+        f"set -e && export EMSDK_QUIET=1 && "
+        f"source {shlex.quote(str(emsdk_env))} >/dev/null && "
+        'exec "${EMSDK_NODE:?emsdk_env.sh did not export EMSDK_NODE}" '
+        + " ".join(
+            shlex.quote(str(argument))
+            for argument in (
+                replay,
+                pyodide_dist,
+                site_url,
+                JUPYTERLITE_NOTEBOOK,
+                package_cache,
+                report_file,
+            )
+        )
+    )
+    print(f"==> Running {JUPYTERLITE_NOTEBOOK} through the site's kernel under Node")
+    print(f"    $ {command}", flush=True)
+    try:
+        result = subprocess.run(["bash", "-c", command])
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    if result.returncode != 0:
+        sys.exit(
+            f"Notebook test FAILED: the kernel replay exited "
+            f"{result.returncode} before finishing the notebook; its output "
+            f"above has the cause."
+        )
+    failure = notebook_report_failure(
+        json.loads(report_file.read_text(encoding="utf-8"))
+    )
+    if failure:
+        sys.exit(f"Notebook test FAILED: {failure}")
+
+    print(
+        f"Notebook test PASSED: {JUPYTERLITE_NOTEBOOK} runs in the site's "
+        f"kernel and initialises PyRosetta."
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI / main.
 # ---------------------------------------------------------------------------
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1800,7 +2210,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "and assert that `import pyrosetta; pyrosetta.init()` prints the "
             "M1 banner. "
             "Phase 5 (--browser-test): serve that wheel to a real browser and "
-            "assert the same banner."
+            "assert the same banner. "
+            "Phase 6 (--jupyterlite): build a static JupyterLite site that runs "
+            "PyRosetta in a notebook. "
+            "Phase 7 (--jupyterlite-test): run that site's notebook through its "
+            "own kernel under Node and assert that every cell succeeds and "
+            "prints the M1 banner."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1821,10 +2236,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--skip-pyodide-build-phase", action="store_true",
-        help="Skip Phase 3 (pyodide build). Without --test the script stops "
-             "after Phase 2 (or after the toolchain install if "
-             "--skip-build-phase is also set); with --test it goes on to test "
-             "whichever wheel is already in the build root's dist/.",
+        help="Skip Phase 3 (pyodide build). With none of the later phases "
+             "asked for, the script stops after Phase 2 (or after the "
+             "toolchain install if --skip-build-phase is also set); with any "
+             "of them it goes on to use whichever wheel is already in the "
+             "build root's dist/.",
     )
     parser.add_argument(
         "--database", default="core", choices=["core", "full"],
@@ -1856,6 +2272,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "flags to test an already-built wheel.",
     )
     parser.add_argument(
+        "--jupyterlite", action="store_true",
+        help="Phase 6: build a static JupyterLite site under the build root, "
+             "with the wheel and an example notebook, from which a browser "
+             "runs PyRosetta with no server-side Python. Installs JupyterLite "
+             "into the toolchain prefix on first use. Pass both --skip flags "
+             "to package an already-built wheel.",
+    )
+    parser.add_argument(
+        "--jupyterlite-test", action="store_true",
+        help="Phase 7: build the JupyterLite site, then run its example "
+             "notebook through the site's own Pyodide kernel under Node, "
+             "installing the kernel and PyRosetta from the site served on "
+             "loopback, and assert that every cell succeeds and PyRosetta "
+             "prints the M1 banner. Needs network access: Pyodide's own "
+             "packages come from jsDelivr, as they do for a visitor. Implies "
+             "--jupyterlite.",
+    )
+    parser.add_argument(
         "--clean", action="store_true",
         help="Remove the WASM build dir for this --type. "
              "Does not touch the native build dir or the toolchain prefix.",
@@ -1864,7 +2298,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--version-file", default=None,
         help="JSON version file (pass-through to inner build.py --version).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # The notebook test always builds the site it tests. A site left over from
+    # an earlier run would carry that run's wheel.
+    if args.jupyterlite_test:
+        args.jupyterlite = True
+    return args
 
 
 def main(argv: list[str]) -> int:
@@ -1886,6 +2325,10 @@ def main(argv: list[str]) -> int:
     prefix = build_prefix_root()
     prefix.mkdir(parents=True, exist_ok=True)
 
+    # Every phase after packaging needs a wheel, whether the package phase
+    # just made one or dist/ already holds it.
+    needs_wheel = args.test or args.browser_test or args.jupyterlite
+
     phases = []
     phases.append("toolchain install")
     if not args.skip_build_phase:
@@ -1898,6 +2341,10 @@ def main(argv: list[str]) -> int:
         phases.append("test (headless smoke test)")
     if args.browser_test:
         phases.append("browser test (chrome-headless-shell)")
+    if args.jupyterlite:
+        phases.append("JupyterLite site")
+    if args.jupyterlite_test:
+        phases.append("notebook test (the site's kernel under Node)")
     print(f"PyRosetta-WASM toolchain prefix: {prefix}")
     print(f"PyRosetta-WASM build root:       {build_root(args.type)}")
     print(f"Phases to run:                   {', '.join(phases)}")
@@ -1936,16 +2383,16 @@ def main(argv: list[str]) -> int:
         wheel = run_pyodide_build_phase(
             prefix, pyodide_venv_bin, emsdk_env, args, inner_build_root
         )
-        if (args.test or args.browser_test) and wheel is None:
+        if needs_wheel and wheel is None:
             sys.exit(
-                "The package phase produced no wheel to smoke-test. Falling "
+                "The package phase produced no wheel to test. Falling "
                 "back to whatever dist/ still holds would report a pass for "
                 "a build that made nothing."
             )
         if wheel is not None and args.database == "core":
             wheel = write_core_database_wheel(wheel)
 
-    if (args.test or args.browser_test) and wheel is None:
+    if needs_wheel and wheel is None:
         wheel = find_wheel_to_test(wheel_dist_dir(args.type))
 
     # Phase 4.
@@ -1956,6 +2403,17 @@ def main(argv: list[str]) -> int:
     if args.browser_test:
         chrome_bin = install_chrome_headless_shell(prefix)
         run_browser_test_phase(prefix, args, wheel, chrome_bin)
+
+    # Phase 6.
+    if args.jupyterlite:
+        jupyterlite_venv_bin, comm_wheel = install_jupyterlite_env(prefix)
+        site = run_jupyterlite_build_phase(
+            jupyterlite_venv_bin, comm_wheel, args, wheel
+        )
+
+    # Phase 7.
+    if args.jupyterlite_test:
+        run_jupyterlite_test_phase(prefix, emsdk_env, args, site)
 
     return 0
 

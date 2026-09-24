@@ -768,5 +768,218 @@ class WaitForBrowserResultTest(unittest.TestCase):
         self.assertIn("no result after", str(raised.exception))
 
 
+# What `pyrosetta.init()` prints, cut down to the lines the M1 assertions need.
+BANNER = (
+    "┌" + "─" * 79 + "┐\n"
+    "│" + "PyRosetta-4".center(79) + "│\n"
+    "└" + "─" * 79 + "┘\n"
+    "core.init: Rosetta version: 0.0.dev0\n"
+    "basic.random.init_random_generator: RandomGenerator:init: Normal mode\n"
+)
+
+
+def stdout(text):
+    return {"output_type": "stream", "name": "stdout", "text": text}
+
+
+class NotebookReportFailureTest(unittest.TestCase):
+    """The verdict on a notebook run through the site's kernel."""
+
+    def test_passes_when_every_cell_succeeds_and_the_banner_was_printed(self):
+        report = {
+            "cells": [
+                {"id": "install", "status": "ok", "outputs": []},
+                {"id": "init", "status": "ok", "outputs": [stdout(BANNER)]},
+            ]
+        }
+        self.assertIsNone(build_wasm.notebook_report_failure(report))
+
+    def test_names_the_cell_that_raised_and_its_exception(self):
+        report = {
+            "cells": [
+                {"id": "init", "status": "ok", "outputs": [stdout(BANNER)]},
+                {
+                    "id": "score",
+                    "status": "error",
+                    "ename": "<class 'RuntimeError'>",
+                    "evalue": "memory access out of bounds",
+                    "traceback": ["Traceback (most recent call last):"],
+                    "outputs": [],
+                },
+            ]
+        }
+        failure = build_wasm.notebook_report_failure(report)
+        self.assertIn("cell score", failure)
+        self.assertIn("RuntimeError", failure)
+        self.assertIn("memory access out of bounds", failure)
+
+    def test_a_traceback_reaches_the_log_without_its_control_characters(self):
+        """IPython colours every traceback, and a cell's code controls the
+        rest of the text, which can carry sequences that rewrite a terminal."""
+        report = {
+            "cells": [
+                {
+                    "id": "score",
+                    "status": "error",
+                    "ename": "<class 'ZeroDivisionError'>",
+                    "evalue": "division by zero",
+                    "traceback": [
+                        "\x1b[31mZeroDivisionError\x1b[39m  Traceback",
+                        "\x1b]0;retitled\x07----> 1 1/0",
+                    ],
+                    "outputs": [],
+                }
+            ]
+        }
+        failure = build_wasm.notebook_report_failure(report)
+        self.assertNotIn("\x1b", failure)
+        self.assertNotIn("\x07", failure)
+        self.assertIn("ZeroDivisionError  Traceback\n", failure)
+        self.assertIn("\\x1b]0;retitled\\x07----> 1 1/0", failure)
+
+    def test_fails_when_the_tracer_never_reached_a_cell(self):
+        """What a muted tracer with no logging route looks like from the
+        notebook's side: the box is a Python print and still arrives, while
+        the C++ tracer's lines do not."""
+        box = "".join(BANNER.splitlines(keepends=True)[:3])
+        report = {"cells": [{"id": "init", "status": "ok", "outputs": [stdout(box)]}]}
+        failure = build_wasm.notebook_report_failure(report)
+        self.assertIn("required substrings are absent", failure)
+        self.assertIn("core.init:", failure)
+        self.assertIn("basic.random.init_random_generator:", failure)
+        self.assertNotIn("'PyRosetta-4'", failure)
+
+    def test_finds_the_banner_across_separate_stream_writes(self):
+        """The kernel's streams deliver whatever each write handed them:
+        `print` writes its text and its newline separately, and `logging`
+        writes one record at a time."""
+        lines = BANNER.splitlines(keepends=True)
+        report = {
+            "cells": [
+                {"id": "import", "status": "ok", "outputs": [stdout(lines[0])]},
+                {
+                    "id": "init",
+                    "status": "ok",
+                    "outputs": [stdout(line) for line in lines[1:]],
+                },
+            ]
+        }
+        self.assertIsNone(build_wasm.notebook_report_failure(report))
+
+    def test_a_run_with_no_cells_fails(self):
+        """A notebook with no code cells must not pass by asserting nothing."""
+        self.assertIsNotNone(build_wasm.notebook_report_failure({"cells": []}))
+
+
+class JupyterLiteConfigTest(unittest.TestCase):
+    """The configuration the JupyterLite site is built from."""
+
+    def test_the_kernel_loads_the_pyodide_release_the_wheel_was_built_for(self):
+        """The notebook test loads this release from the cross-build
+        environment, standing in for the CDN copy the site names; the stand-in
+        is only faithful while the two are the same release."""
+        settings = build_wasm.jupyterlite_config()["jupyter-config-data"][
+            "litePluginSettings"
+        ]["@jupyterlite/pyodide-kernel-extension:kernel"]
+        self.assertEqual(
+            settings["pyodideUrl"],
+            f"https://cdn.jsdelivr.net/pyodide/v{build_wasm.PYODIDE_VERSION}"
+            f"/full/pyodide.js",
+        )
+
+
+class JupyterLiteBuildEnvTest(unittest.TestCase):
+    """The environment the site is built in."""
+
+    def test_drops_the_variables_that_would_change_what_the_site_ships(self):
+        env = build_wasm.jupyterlite_build_env(
+            {
+                "JUPYTERLITE_PYODIDE_URL": "https://example.invalid/pyodide.tar.bz2",
+                "JUPYTERLITE_APP_ARCHIVE": "/tmp/app.tgz",
+            }
+        )
+        self.assertNotIn("JUPYTERLITE_PYODIDE_URL", env)
+        self.assertNotIn("JUPYTERLITE_APP_ARCHIVE", env)
+
+    def test_tells_jupyter_to_read_no_config_files(self):
+        self.assertEqual(build_wasm.jupyterlite_build_env({})["JUPYTER_NO_CONFIG"], "1")
+
+    def test_keeps_the_rest_of_the_host_environment(self):
+        env = build_wasm.jupyterlite_build_env({"PATH": "/usr/bin", "HOME": "/root"})
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertEqual(env["HOME"], "/root")
+
+
+class RunJupyterLiteTestPhaseTest(unittest.TestCase):
+    def test_refuses_a_site_whose_kernel_names_another_pyodide(self):
+        """The replay runs the cross-build environment's Pyodide in place of
+        the one the site names, so a pass on any other site would describe a
+        runtime no visitor gets."""
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch = Path(scratch)
+            dist = scratch / "dist"
+            dist.mkdir()
+            (dist / "pyodide.mjs").write_text("")
+            site = scratch / "site"
+            site.mkdir()
+            (site / "jupyter-lite.json").write_text(json.dumps({
+                "jupyter-config-data": {"litePluginSettings": {
+                    "@jupyterlite/pyodide-kernel-extension:kernel": {
+                        "pyodideUrl": "./static/pyodide/pyodide.js",
+                    },
+                }},
+            }))
+            # build_root is patched too, so that a regression in the check
+            # reaches scratch files rather than the real build root.
+            with mock.patch.object(
+                build_wasm, "pyodide_browser_dist_dir", lambda prefix: dist
+            ), mock.patch.object(
+                build_wasm, "build_root", lambda build_type: scratch
+            ), mock.patch.object(build_wasm.subprocess, "run") as run:
+                with self.assertRaises(SystemExit) as raised:
+                    build_wasm.run_jupyterlite_test_phase(
+                        scratch, scratch / "emsdk_env.sh", mock.Mock(type="Release"), site
+                    )
+            run.assert_not_called()
+        self.assertIn("./static/pyodide/pyodide.js", str(raised.exception))
+
+
+class ExampleNotebookTest(unittest.TestCase):
+    """The notebook the site ships and the notebook test runs."""
+
+    def setUp(self):
+        path = Path(__file__).resolve().parent / "wasm_jupyterlite_example.ipynb"
+        self.notebook = json.loads(path.read_text(encoding="utf-8"))
+        self.code_cells = [
+            cell for cell in self.notebook["cells"] if cell["cell_type"] == "code"
+        ]
+
+    def test_names_the_kernel_the_site_registers(self):
+        """The Pyodide kernel registers itself as `python`. A notebook naming
+        any other kernel opens in the browser asking the visitor to pick one."""
+        self.assertEqual(self.notebook["metadata"]["kernelspec"]["name"], "python")
+
+    def test_installs_pyrosetta_before_anything_imports_it(self):
+        """The site indexes the wheel for `%pip`; nothing installs it on
+        import."""
+        self.assertEqual("".join(self.code_cells[0]["source"]), "%pip install pyrosetta")
+
+    def test_carries_no_outputs(self):
+        """Stored outputs would show a visitor results from whichever build
+        last ran the notebook, before they have run anything."""
+        for cell in self.code_cells:
+            with self.subTest(cell=cell["id"]):
+                self.assertEqual(cell["outputs"], [])
+                self.assertIsNone(cell["execution_count"])
+
+
+class ParseArgsTest(unittest.TestCase):
+    def test_the_notebook_test_builds_the_site_it_tests(self):
+        self.assertTrue(build_wasm.parse_args(["--jupyterlite-test"]).jupyterlite)
+
+    def test_building_the_site_does_not_run_the_notebook_test(self):
+        self.assertFalse(build_wasm.parse_args(["--jupyterlite"]).jupyterlite_test)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
