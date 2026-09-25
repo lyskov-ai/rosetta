@@ -21,6 +21,7 @@ loaded through importlib instead.
 from __future__ import annotations
 
 import base64
+import contextlib
 import csv
 import hashlib
 import importlib.util
@@ -28,7 +29,9 @@ import io
 import json
 import os
 import queue
+import shlex
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -795,6 +798,15 @@ class NotebookReportFailureTest(unittest.TestCase):
         }
         self.assertIsNone(build_wasm.notebook_report_failure(report))
 
+    def test_passes_a_run_whose_browser_only_cell_was_skipped(self):
+        report = {
+            "cells": [
+                {"id": "init", "status": "ok", "outputs": [stdout(BANNER)]},
+                {"id": "rcsb", "status": "skipped", "outputs": []},
+            ]
+        }
+        self.assertIsNone(build_wasm.notebook_report_failure(report))
+
     def test_names_the_cell_that_raised_and_its_exception(self):
         report = {
             "cells": [
@@ -944,6 +956,59 @@ class RunJupyterLiteTestPhaseTest(unittest.TestCase):
             run.assert_not_called()
         self.assertIn("./static/pyodide/pyodide.js", str(raised.exception))
 
+    def run_phase_with_replay_report(self, cells):
+        """Run the phase against a scratch site, with a stand-in replay that
+        writes ``cells`` as its report. Returns the replay's command line and
+        what the phase printed."""
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch = Path(scratch)
+            dist = scratch / "dist"
+            dist.mkdir()
+            (dist / "pyodide.mjs").write_text("")
+            site = scratch / "site"
+            site.mkdir()
+            (site / "jupyter-lite.json").write_text(
+                json.dumps(build_wasm.jupyterlite_config())
+            )
+
+            def replay(argv):
+                report_file = scratch / "jupyterlite-test-report.json"
+                report_file.write_text(json.dumps({"cells": cells}))
+                return mock.Mock(returncode=0)
+
+            printed = io.StringIO()
+            with mock.patch.object(
+                build_wasm, "pyodide_browser_dist_dir", lambda prefix: dist
+            ), mock.patch.object(
+                build_wasm, "build_root", lambda build_type: scratch
+            ), mock.patch.object(
+                build_wasm.subprocess, "run", side_effect=replay
+            ) as run, contextlib.redirect_stdout(printed):
+                build_wasm.run_jupyterlite_test_phase(
+                    scratch, scratch / "emsdk_env.sh", mock.Mock(type="Release"), site
+                )
+        return run.call_args.args[0][2], printed.getvalue()
+
+    def test_tells_the_replay_which_tag_to_skip(self):
+        command, _ = self.run_phase_with_replay_report(
+            [{"id": "init", "status": "ok", "outputs": [stdout(BANNER)]}]
+        )
+        self.assertTrue(
+            command.endswith(" " + shlex.quote(build_wasm.JUPYTERLITE_BROWSER_ONLY_TAG))
+        )
+
+    def test_names_the_cells_the_replay_skipped(self):
+        """A skipped cell is code the gate did not run, so a pass says so."""
+        _, printed = self.run_phase_with_replay_report(
+            [
+                {"id": "init", "status": "ok", "outputs": [stdout(BANNER)]},
+                {"id": "rcsb", "status": "skipped", "outputs": []},
+            ]
+        )
+        self.assertIn("Notebook test PASSED", printed)
+        self.assertIn("Skipped 1 cell(s) tagged browser-only", printed)
+        self.assertIn(": rcsb\n", printed)
+
 
 class ExampleNotebookTest(unittest.TestCase):
     """The notebook the site ships and the notebook test runs."""
@@ -964,6 +1029,40 @@ class ExampleNotebookTest(unittest.TestCase):
         """The site indexes the wheel for `%pip`; nothing installs it on
         import."""
         self.assertEqual("".join(self.code_cells[0]["source"]), "%pip install pyrosetta")
+
+    def test_tags_the_cell_that_fetches_from_rcsb_for_the_browser_alone(self):
+        """Its download goes through the browser, which the notebook test's
+        Node replay has none of."""
+        fetching = [
+            cell for cell in self.code_cells if "pose_from_rcsb" in "".join(cell["source"])
+        ]
+        self.assertEqual(len(fetching), 1)
+        self.assertIn(
+            build_wasm.JUPYTERLITE_BROWSER_ONLY_TAG, fetching[0]["metadata"]["tags"]
+        )
+
+    def test_its_rcsb_cell_downloads_over_https(self):
+        """A page served over https cannot fetch a plain http:// URL: Chrome
+        blocks it as mixed content. The browser test serves the site over
+        http, where Chrome allows it, so only this test sees the URL."""
+        rcsb_path = (
+            Path(__file__).resolve().parent / "src" / "pyrosetta" / "toolbox" / "rcsb.py"
+        )
+        spec = importlib.util.spec_from_file_location("rcsb", rcsb_path)
+        rcsb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rcsb)
+        requested = []
+
+        def urlretrieve(url):
+            requested.append(url)
+            downloaded = Path(scratch) / "downloaded.pdb"
+            downloaded.write_text("ATOM\n" * 40)
+            return str(downloaded), None
+
+        with tempfile.TemporaryDirectory() as scratch:
+            with mock.patch.object(rcsb, "urllib_urlretrieve", urlretrieve):
+                rcsb.load_from_rcsb("1ubq", str(Path(scratch) / "1UBQ.pdb"))
+        self.assertEqual(requested, ["https://files.rcsb.org/download/1UBQ.pdb"])
 
     def test_carries_no_outputs(self):
         """Stored outputs would show a visitor results from whichever build
@@ -1088,6 +1187,83 @@ class JupyterLiteDriveFailureTest(unittest.TestCase):
         self.assertIsNotNone(build_wasm.jupyterlite_drive_failure(report))
 
 
+def files_report(round_trip=None, fetched=None):
+    """A JupyterLite browser run's report whose file marks passed, with
+    ``round_trip`` and ``fetched`` overriding what those marks carry. A mark
+    given as None is left out."""
+    marks = [
+        {"name": "kernel-ready", "cwd": "/drive"},
+        {"name": "pdb-round-trip", "cwd": "/drive", "listed": True,
+         "identical": True, "residues": 13, "expected": 13, **(round_trip or {})},
+        {"name": "rcsb-fetched", "cwd": "/drive", "listed": True, "residues": 76,
+         **(fetched or {})},
+    ]
+    return {"marks": marks}
+
+
+class JupyterLiteFilesFailureTest(unittest.TestCase):
+    """The check that the JupyterLite browser test moved files through /drive."""
+
+    def test_passes_a_run_that_moved_files_both_ways(self):
+        self.assertIsNone(build_wasm.jupyterlite_files_failure(files_report()))
+
+    def test_fails_a_run_that_never_reported_the_round_trip(self):
+        report = files_report()
+        del report["marks"][1]
+        failure = build_wasm.jupyterlite_files_failure(report)
+        self.assertIn("never reported writing a PDB", failure)
+
+    def test_fails_a_round_trip_made_outside_drive(self):
+        """Pyodide's in-memory filesystem passes a round trip without the file
+        browser taking part."""
+        failure = build_wasm.jupyterlite_files_failure(
+            files_report(round_trip={"cwd": "/home/pyodide"})
+        )
+        self.assertIn("written in /home/pyodide, not /drive", failure)
+
+    def test_fails_when_the_file_browser_does_not_list_the_written_pdb(self):
+        failure = build_wasm.jupyterlite_files_failure(
+            files_report(round_trip={"listed": False})
+        )
+        self.assertIn("missing from the file browser's listing", failure)
+
+    def test_fails_when_the_pdb_read_back_differs_from_what_was_written(self):
+        failure = build_wasm.jupyterlite_files_failure(
+            files_report(round_trip={"identical": False})
+        )
+        self.assertIn("differs from the bytes Rosetta wrote", failure)
+
+    def test_fails_when_the_reloaded_pose_has_other_residues(self):
+        failure = build_wasm.jupyterlite_files_failure(
+            files_report(round_trip={"residues": 12})
+        )
+        self.assertIn("has 12 residues, where the pose written had 13", failure)
+
+    def test_fails_a_run_that_never_reported_fetching_from_rcsb(self):
+        report = files_report()
+        del report["marks"][2]
+        failure = build_wasm.jupyterlite_files_failure(report)
+        self.assertIn("never reported fetching a structure from RCSB", failure)
+
+    def test_fails_an_rcsb_fetch_made_outside_drive(self):
+        failure = build_wasm.jupyterlite_files_failure(
+            files_report(fetched={"cwd": "/home/pyodide"})
+        )
+        self.assertIn("wrote its PDB in /home/pyodide, not /drive", failure)
+
+    def test_fails_when_the_fetched_pdb_is_not_in_drive(self):
+        failure = build_wasm.jupyterlite_files_failure(
+            files_report(fetched={"listed": False})
+        )
+        self.assertIn("missing from /drive", failure)
+
+    def test_fails_when_pose_from_rcsb_loaded_no_residues(self):
+        failure = build_wasm.jupyterlite_files_failure(
+            files_report(fetched={"residues": 0})
+        )
+        self.assertIn("loaded 0 residues", failure)
+
+
 class JupyterLiteBrowserTestServerTest(unittest.TestCase):
     """The server the JupyterLite browser test opens the site from."""
 
@@ -1178,6 +1354,28 @@ class JupyterLiteBrowserTestCellTest(unittest.TestCase):
         )
         cell = build_wasm.jupyterlite_browser_test_cell("the-run-token")
         self.assertIn(install, [line.strip() for line in cell.splitlines()])
+
+    def test_runs_the_example_notebooks_browser_only_cells_verbatim(self):
+        """The notebook test skips these cells, so this is the only test that
+        runs their code. A copy that drifted from the notebook would test
+        something no visitor runs."""
+        notebook = json.loads(
+            (
+                Path(__file__).resolve().parent / "wasm_jupyterlite_example.ipynb"
+            ).read_text(encoding="utf-8")
+        )
+        browser_only = [
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if build_wasm.JUPYTERLITE_BROWSER_ONLY_TAG
+            in cell.get("metadata", {}).get("tags", [])
+        ]
+        self.assertTrue(browser_only)
+        cell = build_wasm.jupyterlite_browser_test_cell("the-run-token")
+        for source in browser_only:
+            with self.subTest(source=source):
+                # The test's cell runs everything inside one `try:`.
+                self.assertIn(textwrap.indent(source, "    ") + "\n", cell)
 
     def test_refuses_a_cell_with_nowhere_to_put_the_token(self):
         """Every post from such a cell would be refused, and the run would only

@@ -1,8 +1,10 @@
 # Browser end of `build-wasm.py --jupyterlite-browser-test`. The harness opens
 # the site's REPL with this file as its one cell, so the site's own kernel
 # worker runs it in a real browser. It installs PyRosetta as the example
-# notebook does, imports and initialises it, and posts each stage and a verdict
-# back to the harness. The harness puts the run's token in place of @RUN_TOKEN@.
+# notebook does, and imports and initialises it. Then it moves a PDB through the
+# file browser's /drive and runs the notebook's cell that fetches one from RCSB.
+# It posts each stage and a verdict back to the harness. The harness puts the
+# run's token in place of @RUN_TOKEN@.
 import json
 import os
 import traceback
@@ -60,6 +62,40 @@ try:
     await mark("pyrosetta-imported")
     pyrosetta.init()
     await mark("pyrosetta-initialised")
+
+    # A file the kernel writes to /drive is saved into the file browser's
+    # storage by the same call an upload of up to 1 MB makes, and a download
+    # reads it back from there. So a PDB written and loaded again has gone both
+    # ways. The copy in /tmp never leaves Pyodide's in-memory filesystem.
+    peptide = pyrosetta.pose_from_sequence("AFILVWYGPSTNQ")
+    peptide.dump_pdb("round-trip.pdb")
+    peptide.dump_pdb("/tmp/round-trip.pdb")
+    reloaded = pyrosetta.pose_from_pdb("round-trip.pdb")
+    with open("round-trip.pdb", "rb") as drive, open("/tmp/round-trip.pdb", "rb") as memory:
+        identical = drive.read() == memory.read()
+    await mark(
+        "pdb-round-trip",
+        cwd=os.getcwd(),
+        listed="round-trip.pdb" in os.listdir(),
+        identical=identical,
+        residues=reloaded.total_residue(),
+        expected=peptide.total_residue(),
+    )
+
+    # The example notebook's browser-only cell, verbatim.
+    import pyodide_http
+    pyodide_http.patch_all()
+
+    from pyrosetta.toolbox.rcsb import pose_from_rcsb
+
+    ubiquitin = pose_from_rcsb("1UBQ")
+    print(f"1UBQ: {ubiquitin.total_residue()} residues")
+    await mark(
+        "rcsb-fetched",
+        cwd=os.getcwd(),
+        listed="1UBQ.clean.pdb" in os.listdir(),
+        residues=ubiquitin.total_residue(),
+    )
 except BaseException:
     error = traceback.format_exc()
     print(error)

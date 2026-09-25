@@ -8,14 +8,16 @@
 // script makes the same calls in the same order under Node, then drives
 // `pyodide_kernel.kernel_instance` the way the worker's `execute` does. What it
 // cannot reach is anything the worker does with browser APIs: the `/drive`
-// mount of the site's file browser, stdin, and comms.
+// mount of the site's file browser, stdin, and comms. So a code cell tagged
+// <browser-only tag> is skipped and reported as skipped, rather than run where
+// it cannot pass; `--jupyterlite-browser-test` runs its code instead.
 //
 // The order and the URLs below follow `@jupyterlite/pyodide-kernel` 0.7.2 —
 // `initRemoteOptions` and `PyodideRemoteKernel.initialize` in its bundle. Move
 // them together with the kernel pin in wasm_jupyterlite_requirements.txt.
 //
 //   node wasm_jupyterlite_test.mjs <pyodide dist> <site URL> <notebook>
-//       <package cache dir> <report file>
+//       <package cache dir> <report file> <browser-only tag>
 //
 // Everything a cell prints goes to this script's stdout as it arrives. What
 // each cell did goes to the report file as JSON, one entry per cell run, and
@@ -25,11 +27,11 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const [distDir, siteUrl, notebookPath, packageCacheDir, reportFile] =
+const [distDir, siteUrl, notebookPath, packageCacheDir, reportFile, browserOnlyTag] =
   process.argv.slice(2);
-if (!reportFile) {
+if (!browserOnlyTag) {
   console.error("usage: node wasm_jupyterlite_test.mjs <pyodide dist> " +
-    "<site URL> <notebook> <package cache dir> <report file>");
+    "<site URL> <notebook> <package cache dir> <report file> <browser-only tag>");
   process.exit(2);
 }
 
@@ -179,6 +181,11 @@ for (const cell of notebook.cells) {
   if (cell.cell_type !== "code") continue;
   const source = Array.isArray(cell.source) ? cell.source.join("") : cell.source;
   console.log(`\nIn: ${source.split("\n").join("\n    ")}`);
+  if ((cell.metadata?.tags || []).includes(browserOnlyTag)) {
+    cells.push({id: cell.id, source, status: "skipped", outputs: []});
+    mark(`cell ${cell.id}: skipped, tagged ${browserOnlyTag}`);
+    continue;
+  }
   outputs = [];
   const result = toJs(await kernel.run(source));
   cells.push({

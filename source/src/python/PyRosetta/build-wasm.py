@@ -43,14 +43,16 @@ Pipeline:
    that runs PyRosetta in a notebook entirely in the browser (M2), with
    the wheel and an example notebook. Run only with ``--jupyterlite``.
 7. Phase 7 — notebook test: run the site's example notebook through the
-   site's own Pyodide kernel under Node, and assert that every cell
-   succeeds and prints the M1 banner. M2's CI gate. Run only with
-   ``--jupyterlite-test``, which implies ``--jupyterlite``.
+   site's own Pyodide kernel under Node, and assert that every cell it runs
+   succeeds and the M1 banner is printed. It skips cells tagged
+   ``browser-only``. M2's CI gate. Run only with ``--jupyterlite-test``,
+   which implies ``--jupyterlite``.
 8. Phase 8 — JupyterLite browser test: open the site's REPL in
    ``chrome-headless-shell`` and assert that the site's kernel, running in
-   the browser, installs and initialises PyRosetta and prints the M1 banner.
-   Run only with ``--jupyterlite-browser-test``, which implies
-   ``--jupyterlite``.
+   the browser, installs and initialises PyRosetta and prints the M1 banner,
+   moves a PDB through the file browser's ``/drive`` both ways, and runs the
+   notebook's ``browser-only`` cell. Run only with
+   ``--jupyterlite-browser-test``, which implies ``--jupyterlite``.
 
 Host prerequisites:
     - git, curl, bash
@@ -1967,6 +1969,11 @@ JUPYTERLITE_NOTEBOOK = "PyRosetta.ipynb"
 
 JUPYTERLITE_KERNEL_PLUGIN = "@jupyterlite/pyodide-kernel-extension:kernel"
 
+# The nbformat cell tag for a notebook cell that only a browser can run. The
+# notebook test skips such a cell, and the JupyterLite browser test runs its
+# code instead.
+JUPYTERLITE_BROWSER_ONLY_TAG = "browser-only"
+
 
 def jupyterlite_site_dir(build_type: str) -> Path:
     """Where the JupyterLite site is built. Written by the site phase and
@@ -2098,12 +2105,14 @@ ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
 def notebook_report_failure(report: dict) -> str | None:
     """Why a notebook run failed, or None if it passed.
 
-    A run passes when every code cell it ran succeeded and the cells' streams,
-    together, carry the M1 banner. The banner is asserted on the streams rather
-    than on the replay's own output because the streams are what a notebook
-    shows under a cell, and the banner reaches them by two paths. The box and
-    the ``PyRosetta-4`` line are a Python ``print``. The ``core.init:`` and
-    ``basic.random`` lines come from Rosetta's C++ tracer. In the kernel
+    A run passes when every code cell it ran succeeded or was skipped, and the
+    cells' streams, together, carry the M1 banner. The replay skips only a cell
+    tagged ``JUPYTERLITE_BROWSER_ONLY_TAG``. The banner is asserted on the
+    streams rather than on the replay's own output because the streams are what
+    a notebook shows under a cell, and the banner reaches them by two paths.
+    The box and the ``PyRosetta-4`` line are a Python ``print``. The
+    ``core.init:`` and ``basic.random`` lines come from Rosetta's C++ tracer.
+    In the kernel
     ``pyrosetta._is_interactive()`` is True, since ``__main__`` has no
     ``__file__``, so ``init()`` mutes the tracer's own stdout and routes it
     through Python's ``logging`` to the cell's stdout instead. The muted path
@@ -2116,7 +2125,7 @@ def notebook_report_failure(report: dict) -> str | None:
     as everything else this file prints from a run is."""
     cells = report.get("cells", [])
     for cell in cells:
-        if cell.get("status") != "ok":
+        if cell.get("status") not in ("ok", "skipped"):
             traceback = "\n".join(cell.get("traceback") or [])
             failure = (
                 f"cell {cell.get('id')} ended with status "
@@ -2134,7 +2143,8 @@ def notebook_report_failure(report: dict) -> str | None:
     if missing:
         listed = "\n  ".join(repr(s) for s in missing)
         return (
-            f"all {len(cells)} code cells succeeded, but {len(missing)} of the "
+            f"all {len(cells)} code cells succeeded or were skipped, but "
+            f"{len(missing)} of the "
             f"{len(SMOKE_TEST_REQUIRED_OUTPUT)} required substrings are absent "
             f"from what they printed:\n  {listed}"
         )
@@ -2148,8 +2158,8 @@ def run_jupyterlite_test_phase(
     site: Path,
 ) -> None:
     """Run the site's example notebook through the site's own kernel, under
-    Node, and assert that every cell succeeds and PyRosetta prints the M1
-    banner.
+    Node, and assert that every cell it runs succeeds and PyRosetta prints
+    the M1 banner.
 
     This is M2's CI gate. The kernel's Web Worker needs a browser, but it only
     starts Pyodide and hands each cell to ``pyodide_kernel``, which needs
@@ -2157,9 +2167,10 @@ def run_jupyterlite_test_phase(
     calls in the worker's order, against the site served on loopback, so the
     kernel installs itself and PyRosetta from the site's own wheel indexes, as
     it does for a visitor. What it cannot cover is the worker's use of browser
-    APIs: the ``/drive`` file-browser mount, stdin, comms.
-    ``--jupyterlite-browser-test`` runs the worker itself, and checks the
-    mount."""
+    APIs: the ``/drive`` file-browser mount, stdin, comms. So it skips a cell
+    tagged ``JUPYTERLITE_BROWSER_ONLY_TAG`` and names it when the run passes.
+    ``--jupyterlite-browser-test`` runs the worker itself: it checks the mount,
+    and runs the code of each such cell."""
     replay = script_dir() / "wasm_jupyterlite_test.mjs"
     if not replay.is_file():
         sys.exit(f"The notebook test script is missing at {replay}")
@@ -2227,6 +2238,7 @@ def run_jupyterlite_test_phase(
                 JUPYTERLITE_NOTEBOOK,
                 package_cache,
                 report_file,
+                JUPYTERLITE_BROWSER_ONLY_TAG,
             )
         )
     )
@@ -2244,9 +2256,8 @@ def run_jupyterlite_test_phase(
             f"{result.returncode} before finishing the notebook; its output "
             f"above has the cause."
         )
-    failure = notebook_report_failure(
-        json.loads(report_file.read_text(encoding="utf-8"))
-    )
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    failure = notebook_report_failure(report)
     if failure:
         sys.exit(f"Notebook test FAILED: {failure}")
 
@@ -2254,6 +2265,19 @@ def run_jupyterlite_test_phase(
         f"Notebook test PASSED: {JUPYTERLITE_NOTEBOOK} runs in the site's "
         f"kernel and initialises PyRosetta."
     )
+    skipped = [
+        str(cell.get("id"))
+        for cell in report.get("cells", [])
+        if cell.get("status") == "skipped"
+    ]
+    if skipped:
+        print(
+            f"    Skipped {len(skipped)} cell(s) tagged "
+            f"{JUPYTERLITE_BROWSER_ONLY_TAG}, which --jupyterlite-browser-test "
+            f"runs instead: {', '.join(skipped)}".translate(
+                CONTROL_CHARACTER_ESCAPES
+            )
+        )
 
 
 # Where the REPL cell the JupyterLite browser test sends carries the run token.
@@ -2333,13 +2357,69 @@ def jupyterlite_drive_failure(report: dict) -> str | None:
     )
 
 
+def jupyterlite_files_failure(report: dict) -> str | None:
+    """Why a JupyterLite browser run did not move files through ``/drive``, or
+    None if it moved them both ways.
+
+    The cell writes a PDB and loads it back. That stands in for an upload of
+    up to 1 MB and for a download: the kernel's write reaches the file
+    browser's storage by the call such an upload makes, and a download reads
+    the stored file. JupyterLab uploads a larger file in 1 MB chunks, which
+    the storage joins on a path this does not take. The cell also runs the
+    example notebook's browser-only cell, which fetches 1UBQ from RCSB into
+    the same directory.
+
+    Each mark carries the working directory it wrote in, because a round trip
+    anywhere but ``/drive`` stays inside Pyodide's in-memory filesystem and
+    passes without testing the file browser."""
+    marks = {
+        m.get("name"): m for m in report.get("marks", []) if isinstance(m, dict)
+    }
+    round_trip = marks.get("pdb-round-trip")
+    if round_trip is None:
+        return "the kernel never reported writing a PDB and loading it back"
+    if round_trip.get("cwd") != "/drive":
+        return (
+            f"the PDB was written in "
+            f"{ReportHandler.printable(round_trip.get('cwd'))}, not /drive"
+        )
+    if not round_trip.get("listed"):
+        return "a PDB written to /drive is missing from the file browser's listing"
+    if not round_trip.get("identical"):
+        return "a PDB read back from /drive differs from the bytes Rosetta wrote"
+    if round_trip.get("residues") != round_trip.get("expected"):
+        return (
+            f"a PDB reloaded from /drive has "
+            f"{ReportHandler.printable(round_trip.get('residues'))} residues, "
+            f"where the pose written had "
+            f"{ReportHandler.printable(round_trip.get('expected'))}"
+        )
+    fetched = marks.get("rcsb-fetched")
+    if fetched is None:
+        return "the kernel never reported fetching a structure from RCSB"
+    if fetched.get("cwd") != "/drive":
+        return (
+            f"pose_from_rcsb wrote its PDB in "
+            f"{ReportHandler.printable(fetched.get('cwd'))}, not /drive"
+        )
+    if not fetched.get("listed"):
+        return "the PDB pose_from_rcsb loaded is missing from /drive"
+    residues = fetched.get("residues")
+    if not (isinstance(residues, int) and residues > 0):
+        return (
+            f"pose_from_rcsb loaded {ReportHandler.printable(residues)} residues"
+        )
+    return None
+
+
 def run_jupyterlite_browser_test_phase(
     args: argparse.Namespace,
     site: Path,
     chrome_bin: Path,
 ) -> None:
-    """Run PyRosetta in the site's own kernel in a real browser, and assert
-    that ``init()`` prints the M1 banner.
+    """Run PyRosetta in the site's own kernel in a real browser. Assert that
+    ``init()`` prints the M1 banner, and that files move through the file
+    browser both ways.
 
     The notebook test replays the kernel worker under Node; this runs the
     worker itself, beside JupyterLab's UI in one tab. It opens the site's REPL
@@ -2353,7 +2433,10 @@ def run_jupyterlite_browser_test_phase(
     through the site's service worker, and the memory figures are a tab's with
     the REPL app in it. The REPL is the smaller of JupyterLite's apps, so they
     are not the notebook app's. The phase fails if the kernel did not start in
-    ``/drive``. The verdict is judged on the text the kernel hands the worker as
+    ``/drive``, or if the cell could not write a PDB there and load it back. The
+    cell also runs the code of the example notebook's browser-only cell, which
+    fetches a structure from RCSB, so the phase needs rcsb.org as well as the
+    CDN. The verdict is judged on the text the kernel hands the worker as
     the cell's output — the same boundary the notebook test asserts on — not
     on what JupyterLab then renders.
 
@@ -2387,12 +2470,18 @@ def run_jupyterlite_browser_test_phase(
         label,
     )
     judge_browser_run(label, report, sampler, elapsed, chrome_log)
-    failure = jupyterlite_drive_failure(report)
-    if failure:
-        sys.exit(f"{label} FAILED: {failure}.")
+    # The mount first: without it, the files went to Pyodide's in-memory
+    # filesystem, where the round trip passes without testing anything.
+    for failure in (
+        jupyterlite_drive_failure(report),
+        jupyterlite_files_failure(report),
+    ):
+        if failure:
+            sys.exit(f"{label} FAILED: {failure}.")
     print(
-        f"{label} PASSED: the site's kernel mounts /drive and initialises "
-        f"PyRosetta in a browser."
+        f"{label} PASSED: in a browser, the site's kernel mounts /drive, "
+        f"initialises PyRosetta, moves a PDB through /drive both ways, and "
+        f"fetches one from RCSB."
     )
 
 
@@ -2417,10 +2506,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "Phase 6 (--jupyterlite): build a static JupyterLite site that runs "
             "PyRosetta in a notebook. "
             "Phase 7 (--jupyterlite-test): run that site's notebook through its "
-            "own kernel under Node and assert that every cell succeeds and "
-            "prints the M1 banner. "
+            "own kernel under Node and assert that every cell it runs "
+            "succeeds and prints the M1 banner; it skips cells tagged "
+            f"{JUPYTERLITE_BROWSER_ONLY_TAG}. "
             "Phase 8 (--jupyterlite-browser-test): run PyRosetta in that "
-            "site's kernel in a real browser and assert the same banner."
+            "site's kernel in a real browser, assert the same banner, move a "
+            "PDB through the file browser both ways, and run the "
+            f"{JUPYTERLITE_BROWSER_ONLY_TAG} cells."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2489,20 +2581,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Phase 7: build the JupyterLite site, then run its example "
              "notebook through the site's own Pyodide kernel under Node, "
              "installing the kernel and PyRosetta from the site served on "
-             "loopback, and assert that every cell succeeds and PyRosetta "
-             "prints the M1 banner. Needs network access: Pyodide's own "
-             "packages come from jsDelivr, as they do for a visitor. Implies "
-             "--jupyterlite.",
+             "loopback, and assert that every cell it runs succeeds and PyRosetta "
+             "prints the M1 banner. Skips, and names, any cell tagged "
+             f"{JUPYTERLITE_BROWSER_ONLY_TAG}, which --jupyterlite-browser-test "
+             "runs instead. Needs network access: Pyodide's own packages come "
+             "from jsDelivr, as they do for a visitor. Implies --jupyterlite.",
     )
     parser.add_argument(
         "--jupyterlite-browser-test", action="store_true",
         help="Phase 8: build the JupyterLite site, open its REPL in the "
              "pinned chrome-headless-shell, and have the site's own kernel "
              "run `%%pip install pyrosetta`, `import pyrosetta` and "
-             "`pyrosetta.init()`; assert the M1 banner and report peak "
+             "`pyrosetta.init()`, then write a PDB to the file browser's "
+             "/drive and load it back, and run the example notebook's "
+             f"{JUPYTERLITE_BROWSER_ONLY_TAG} cell, which fetches 1UBQ from "
+             "RCSB; assert the M1 banner and both file moves, and report peak "
              "browser memory per stage. Optional: --jupyterlite-test is the "
-             "gate. Needs network access and Chrome's system libraries, as "
-             "--browser-test does. Implies --jupyterlite.",
+             "gate. Needs network access, to jsDelivr and rcsb.org, and "
+             "Chrome's system libraries, as --browser-test does. Implies "
+             "--jupyterlite.",
     )
     parser.add_argument(
         "--clean", action="store_true",
