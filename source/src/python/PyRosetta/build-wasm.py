@@ -46,6 +46,11 @@ Pipeline:
    site's own Pyodide kernel under Node, and assert that every cell
    succeeds and prints the M1 banner. M2's CI gate. Run only with
    ``--jupyterlite-test``, which implies ``--jupyterlite``.
+8. Phase 8 — JupyterLite browser test: open the site's REPL in
+   ``chrome-headless-shell`` and assert that the site's kernel, running in
+   the browser, installs and initialises PyRosetta and prints the M1 banner.
+   Run only with ``--jupyterlite-browser-test``, which implies
+   ``--jupyterlite``.
 
 Host prerequisites:
     - git, curl, bash
@@ -53,8 +58,9 @@ Host prerequisites:
       build.py / Binder build).
     - Python >= 3.8 to run this script (the build's target Python comes
       from uv).
-    - For ``--browser-test`` only: the shared libraries Chrome links
-      against. The phase names any that are missing.
+    - For ``--browser-test`` and ``--jupyterlite-browser-test`` only: the
+      shared libraries Chrome links against. The phases name any that are
+      missing.
 """
 
 from __future__ import annotations
@@ -1312,6 +1318,13 @@ CONTROL_CHARACTER_ESCAPES = {
     code: f"\\x{code:02x}" for code in [*range(0x20), 0x7F]
 }
 
+# CONTROL_CHARACTER_ESCAPES without newline and tab: a traceback is many lines.
+MULTILINE_ESCAPES = {
+    code: escaped
+    for code, escaped in CONTROL_CHARACTER_ESCAPES.items()
+    if code not in (0x09, 0x0A)
+}
+
 
 def servable_name(name: str) -> bool:
     return bool(SERVABLE_FILE_NAME.fullmatch(name)) and not name.startswith(".")
@@ -1493,14 +1506,19 @@ class MemorySampler:
         return max([*recorded, self.pending[1]], default=0)
 
 
-def write_private_file(path: Path, text: str) -> None:
-    """Write a file only its owner can read.
+def open_private_file(path: Path) -> io.TextIOWrapper:
+    """Open a new file for writing that only its owner can read.
 
-    ``Path.write_text`` would leave it at the umask default, which on most
-    hosts means world-readable."""
+    ``open`` would leave it at the umask default, which on most hosts means
+    world-readable."""
     path.unlink(missing_ok=True)  # O_CREAT leaves an existing file's mode.
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+    return os.fdopen(descriptor, "w", encoding="utf-8")
+
+
+def write_private_file(path: Path, text: str) -> None:
+    """Write a file only its owner can read."""
+    with open_private_file(path) as handle:
         handle.write(text)
 
 
@@ -1544,32 +1562,15 @@ class BrowserTestServer(ThreadingHTTPServer):
         self.results = results
 
 
-class BrowserTestHandler(BaseHTTPRequestHandler):
-    """The harness end of the conversation with the page.
+class ReportHandler(BaseHTTPRequestHandler):
+    """The harness end of the conversation with a page in the browser.
 
     The page reports its own progress and verdict by POST instead of the
-    harness reading them out of the browser. That is what keeps this phase
-    dependency-free: driving the browser over the DevTools protocol would mean
-    a WebSocket client, and there is none in the standard library."""
+    harness reading them out of the browser. That is what keeps the browser
+    phases dependency-free: driving the browser over the DevTools protocol
+    would mean a WebSocket client, and there is none in the standard library.
 
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, fmt: str, *fmt_args) -> None:
-        # The page's URL carries the result token, and a request line lands in
-        # build and CI logs. Redacting keeps the token to the run it belongs to.
-        line = redact_token(fmt % fmt_args).translate(CONTROL_CHARACTER_ESCAPES)
-        print(f"    [server] {line}", flush=True)
-
-    def do_GET(self) -> None:
-        path = urllib.parse.urlparse(self.path).path
-        if path == "/":
-            self.send_bytes(self.server.page_html, "text/html; charset=utf-8")
-        elif path.startswith("/pyodide/"):
-            self.serve_pyodide_file(path[len("/pyodide/") :])
-        elif path.startswith("/wheel/"):
-            self.serve_wheel(path[len("/wheel/") :])
-        else:
-            self.send_bytes(b"not found\n", "text/plain", status=404)
+    Needs a server carrying ``token`` and ``results``."""
 
     def do_POST(self) -> None:
         path = urllib.parse.urlparse(self.path).path
@@ -1626,6 +1627,37 @@ class BrowserTestHandler(BaseHTTPRequestHandler):
         redacted = redact_token(str(value))
         return redacted[:limit].translate(CONTROL_CHARACTER_ESCAPES)
 
+    def send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+
+class BrowserTestHandler(ReportHandler):
+    """Serves ``--browser-test``'s page, the Pyodide runtime and the wheel."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *fmt_args) -> None:
+        # The page's URL carries the result token, and a request line lands in
+        # build and CI logs. Redacting keeps the token to the run it belongs to.
+        line = redact_token(fmt % fmt_args).translate(CONTROL_CHARACTER_ESCAPES)
+        print(f"    [server] {line}", flush=True)
+
+    def do_GET(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/":
+            self.send_bytes(self.server.page_html, "text/html; charset=utf-8")
+        elif path.startswith("/pyodide/"):
+            self.serve_pyodide_file(path[len("/pyodide/") :])
+        elif path.startswith("/wheel/"):
+            self.serve_wheel(path[len("/wheel/") :])
+        else:
+            self.send_bytes(b"not found\n", "text/plain", status=404)
+
     def serve_pyodide_file(self, name: str) -> None:
         if not servable_name(name):
             self.send_bytes(b"bad name\n", "text/plain", status=400)
@@ -1641,14 +1673,6 @@ class BrowserTestHandler(BaseHTTPRequestHandler):
             self.send_bytes(b"not found\n", "text/plain", status=404)
             return
         self.send_file(self.server.wheel, "application/octet-stream")
-
-    def send_bytes(self, body: bytes, content_type: str, status: int = 200) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
 
     def send_file(self, path: Path, content_type: str) -> None:
         self.send_response(200)
@@ -1676,6 +1700,7 @@ def wait_for_browser_result(
     sampler: MemorySampler,
     started: float,
     chrome_log: Path,
+    label: str = "Browser test",
 ) -> dict:
     """Wait for the page to post its verdict, sampling memory as it works.
 
@@ -1702,14 +1727,14 @@ def wait_for_browser_result(
         waited = time.monotonic() - started
         if browser.poll() is not None:
             sys.exit(
-                f"Browser test FAILED: the browser exited "
+                f"{label} FAILED: the browser exited "
                 f"{browser.returncode} after {waited:.0f}s without "
                 f"reporting a result. Its last output, from "
                 f"{chrome_log}:\n{chrome_log_tail(chrome_log)}"
             )
         if waited > BROWSER_TEST_TIMEOUT_SECONDS:
             sys.exit(
-                f"Browser test FAILED: no result after "
+                f"{label} FAILED: no result after "
                 f"{BROWSER_TEST_TIMEOUT_SECONDS}s. The page logs above "
                 f"show the last stage it reached; the browser's last "
                 f"output, from {chrome_log}:\n"
@@ -1728,6 +1753,156 @@ def wait_for_browser_result(
         sampler.reached(report)
     sampler.reached("verdict")
     return report
+
+
+def require_chrome_libraries(chrome_bin: Path) -> None:
+    """Exit, naming them, if the host lacks shared libraries the browser needs."""
+    absent = missing_chrome_libraries(chrome_bin)
+    if absent:
+        listed = "\n  ".join(absent)
+        sys.exit(
+            f"The browser cannot start: {len(absent)} shared libraries it needs "
+            f"are missing from this host:\n  {listed}\n"
+            f"Install the packages providing them and re-run. On Ubuntu:\n"
+            f"  apt-get install -y libasound2t64 libatk-bridge2.0-0t64 "
+            f"libatk1.0-0t64 libatspi2.0-0t64 libdbus-1-3 libgbm1 "
+            f"libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2"
+        )
+
+
+def run_page_in_browser(
+    chrome_bin: Path,
+    url: str,
+    server: ThreadingHTTPServer,
+    results: queue.Queue,
+    run_name: str,
+    args: argparse.Namespace,
+    label: str,
+) -> tuple[dict, MemorySampler, float, Path]:
+    """Open ``url`` in the browser, serving ``server`` meanwhile, and wait for
+    the page to post its verdict to it.
+
+    Returns the verdict, the sampler that measured the browser, the run's
+    length in seconds and the browser's own log. The browser's profile, log and
+    launch page sit in the build root under ``run_name``, so each browser phase
+    keeps its own. The profile is new every run: one left over would carry the
+    previous run's HTTP cache and service workers."""
+    # The URL carries the result token, and a process's command line is
+    # readable by every account on the host — /proc/<pid>/cmdline is
+    # world-readable, where a file need not be. So the browser is started on a
+    # private bootstrap page that redirects to the real URL, and its command
+    # line holds nothing but a path.
+    launch_page = build_root(args.type) / f"{run_name}-launch.html"
+    write_private_file(
+        launch_page,
+        "<!doctype html>\n"
+        '<meta charset="utf-8">\n'
+        f'<meta http-equiv="refresh" content="0; url={html.escape(url)}">\n'
+        "<title>Starting the PyRosetta-WASM browser test</title>\n",
+    )
+
+    profile_dir = build_root(args.type) / f"{run_name}-profile"
+    if profile_dir.exists():
+        shutil.rmtree(profile_dir)
+    chrome_log = build_root(args.type) / f"{run_name}-chrome.log"
+
+    command = [
+        str(chrome_bin),
+        "--headless",
+        "--disable-gpu",
+        # A container's /dev/shm is usually 64 MB, and Chrome does not degrade
+        # gracefully when it fills.
+        "--disable-dev-shm-usage",
+        "--no-first-run",
+        f"--user-data-dir={profile_dir}",
+    ]
+    if os.geteuid() == 0:
+        # Chrome refuses to run as root with its sandbox on. A host where the
+        # build runs unprivileged keeps the sandbox.
+        command.append("--no-sandbox")
+    command.append(launch_page.as_uri())
+    print(f"    $ {redact_token(' '.join(command))}", flush=True)
+
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    started = time.monotonic()
+    # Chrome logs console messages with the URL of the document they came
+    # from, and the URL carries the result token, so the log is private too.
+    with open_private_file(chrome_log) as log_file:
+        browser = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT)
+        sampler = MemorySampler(browser.pid, started)
+        try:
+            report = wait_for_browser_result(
+                browser, results, sampler, started, chrome_log, label
+            )
+        finally:
+            browser.terminate()
+            try:
+                browser.wait(30)
+            except subprocess.TimeoutExpired:
+                browser.kill()
+            server.shutdown()
+            server.server_close()
+            launch_page.unlink(missing_ok=True)
+    return report, sampler, time.monotonic() - started, chrome_log
+
+
+def judge_browser_run(
+    label: str,
+    report: dict,
+    sampler: MemorySampler,
+    elapsed: float,
+    chrome_log: Path,
+) -> None:
+    """Print what a browser run measured, then exit unless the page reported
+    success and its output carries the M1 banner.
+
+    The page's output and error are text a run produced, headed for a build
+    log. So their control characters are escaped before they are printed, and
+    a run token is redacted: the M1 page's error is a stack trace, whose frames
+    name the page by its URL."""
+    # The sampler holds the stages, because it is what measured them; the
+    # page's own marks carry what it saw at each, the wasm heap among them.
+    marks = {
+        str(m.get("name")): m
+        for m in report.get("marks", [])
+        if isinstance(m, dict)
+    }
+    print(f"    {'at':>8}  {'peak':>7}  stage")
+    for stage, peak in sampler.peaks.items():
+        mark = marks.get(stage, {})
+        detail = {k: v for k, v in mark.items() if k not in ("name", "seconds")}
+        described = (
+            "  " + ReportHandler.printable(detail) if detail else ""
+        )
+        print(
+            f"    {peak.seconds:7.1f}s  {peak.proportional / 1e9:4.1f} GB  "
+            f"{stage}{described}"
+        )
+    output = str(report.get("output", ""))
+    print(redact_token(output).translate(MULTILINE_ESCAPES))
+    print(
+        f"==> Browser run took {elapsed:.0f}s; peak browser memory "
+        f"{sampler.peak_proportional / 1e9:.1f} GB proportional, "
+        f"{sampler.peak_resident / 1e9:.1f} GB summed resident, "
+        f"from {sampler.samples} samples costing {sampler.cost:.1f}s of the run"
+    )
+
+    if not report.get("ok"):
+        error = str(report.get("error") or "(none given)")
+        sys.exit(
+            f"{label} FAILED: the page reported an error:\n"
+            f"{redact_token(error).translate(MULTILINE_ESCAPES)}\n"
+            f"The browser's own output is in {chrome_log}."
+        )
+
+    missing = [s for s in SMOKE_TEST_REQUIRED_OUTPUT if s not in output]
+    if missing:
+        listed = "\n  ".join(repr(s) for s in missing)
+        sys.exit(
+            f"{label} FAILED: the page finished, but {len(missing)} of the "
+            f"{len(SMOKE_TEST_REQUIRED_OUTPUT)} required substrings are absent "
+            f"from what PyRosetta printed:\n  {listed}"
+        )
 
 
 def run_browser_test_phase(
@@ -1762,130 +1937,24 @@ def run_browser_test_phase(
             f"it."
         )
 
-    absent = missing_chrome_libraries(chrome_bin)
-    if absent:
-        listed = "\n  ".join(absent)
-        sys.exit(
-            f"The browser cannot start: {len(absent)} shared libraries it needs "
-            f"are missing from this host:\n  {listed}\n"
-            f"Install the packages providing them and re-run. On Ubuntu:\n"
-            f"  apt-get install -y libasound2t64 libatk-bridge2.0-0t64 "
-            f"libatk1.0-0t64 libatspi2.0-0t64 libdbus-1-3 libgbm1 "
-            f"libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2"
-        )
+    require_chrome_libraries(chrome_bin)
 
     results: queue.Queue = queue.Queue()
     token = secrets.token_urlsafe(16)
     server = BrowserTestServer(
         page.read_bytes(), pyodide_dist, wheel, token, results
     )
-    threading.Thread(target=server.serve_forever, daemon=True).start()
     query = urllib.parse.urlencode({"wheel": wheel.name, "token": token})
     url = f"http://127.0.0.1:{server.server_address[1]}/?{query}"
-
-    # The URL carries the result token, and a process's command line is
-    # readable by every account on the host — /proc/<pid>/cmdline is
-    # world-readable, where a file need not be. So the browser is started on a
-    # private bootstrap page that redirects to the real URL, and its command
-    # line holds nothing but a path.
-    launch_page = build_root(args.type) / "browser-test-launch.html"
-    write_private_file(
-        launch_page,
-        "<!doctype html>\n"
-        '<meta charset="utf-8">\n'
-        f'<meta http-equiv="refresh" content="0; url={html.escape(url)}">\n'
-        "<title>Starting the PyRosetta-WASM browser test</title>\n",
-    )
-
-    profile_dir = build_root(args.type) / "browser-test-profile"
-    if profile_dir.exists():
-        shutil.rmtree(profile_dir)
-    chrome_log = build_root(args.type) / "browser-test-chrome.log"
-
-    command = [
-        str(chrome_bin),
-        "--headless",
-        "--disable-gpu",
-        # A container's /dev/shm is usually 64 MB, and Chrome does not degrade
-        # gracefully when it fills.
-        "--disable-dev-shm-usage",
-        "--no-first-run",
-        f"--user-data-dir={profile_dir}",
-    ]
-    if os.geteuid() == 0:
-        # Chrome refuses to run as root with its sandbox on. A host where the
-        # build runs unprivileged keeps the sandbox.
-        command.append("--no-sandbox")
-    command.append(launch_page.as_uri())
-
     print(
         f"==> Serving {wheel.name} ({wheel.stat().st_size:,} bytes) at "
         f"{redact_token(url)}"
     )
-    print(f"    $ {redact_token(' '.join(command))}", flush=True)
 
-    started = time.monotonic()
-    with open(chrome_log, "w", encoding="utf-8") as log_file:
-        browser = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT)
-        sampler = MemorySampler(browser.pid, started)
-        try:
-            report = wait_for_browser_result(
-                browser, results, sampler, started, chrome_log
-            )
-        finally:
-            browser.terminate()
-            try:
-                browser.wait(30)
-            except subprocess.TimeoutExpired:
-                browser.kill()
-            server.shutdown()
-            server.server_close()
-            launch_page.unlink(missing_ok=True)
-
-    elapsed = time.monotonic() - started
-    # The sampler holds the stages, because it is what measured them; the
-    # page's own marks carry the clock reading and the wasm heap at each.
-    marks = {
-        str(m.get("name")): m
-        for m in report.get("marks", [])
-        if isinstance(m, dict)
-    }
-    print(f"    {'at':>8}  {'peak':>7}  stage")
-    for stage, peak in sampler.peaks.items():
-        mark = marks.get(stage, {})
-        detail = {k: v for k, v in mark.items() if k not in ("name", "seconds")}
-        described = (
-            "  " + BrowserTestHandler.printable(detail) if detail else ""
-        )
-        print(
-            f"    {peak.seconds:7.1f}s  {peak.proportional / 1e9:4.1f} GB  "
-            f"{stage}{described}"
-        )
-    output = report.get("output", "")
-    print(output)
-    print(
-        f"==> Browser run took {elapsed:.0f}s; peak browser memory "
-        f"{sampler.peak_proportional / 1e9:.1f} GB proportional, "
-        f"{sampler.peak_resident / 1e9:.1f} GB summed resident, "
-        f"from {sampler.samples} samples costing {sampler.cost:.1f}s of the run"
+    report, sampler, elapsed, chrome_log = run_page_in_browser(
+        chrome_bin, url, server, results, "browser-test", args, "Browser test"
     )
-
-    if not report.get("ok"):
-        sys.exit(
-            f"Browser test FAILED: the page reported an error:\n"
-            f"{report.get('error', '(none given)')}\n"
-            f"The browser's own output is in {chrome_log}."
-        )
-
-    missing = [s for s in SMOKE_TEST_REQUIRED_OUTPUT if s not in output]
-    if missing:
-        listed = "\n  ".join(repr(s) for s in missing)
-        sys.exit(
-            f"Browser test FAILED: the page finished, but {len(missing)} of the "
-            f"{len(SMOKE_TEST_REQUIRED_OUTPUT)} required substrings are absent "
-            f"from what PyRosetta printed:\n  {listed}"
-        )
-
+    judge_browser_run("Browser test", report, sampler, elapsed, chrome_log)
     print(f"Browser test PASSED: {wheel.name} initialises PyRosetta in a browser.")
 
 
@@ -2025,13 +2094,6 @@ class JupyterLiteSiteHandler(SimpleHTTPRequestHandler):
 # Colour codes, which IPython puts throughout a traceback.
 ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
 
-# CONTROL_CHARACTER_ESCAPES without newline and tab: a traceback is many lines.
-MULTILINE_ESCAPES = {
-    code: escaped
-    for code, escaped in CONTROL_CHARACTER_ESCAPES.items()
-    if code not in (0x09, 0x0A)
-}
-
 
 def notebook_report_failure(report: dict) -> str | None:
     """Why a notebook run failed, or None if it passed.
@@ -2095,8 +2157,9 @@ def run_jupyterlite_test_phase(
     calls in the worker's order, against the site served on loopback, so the
     kernel installs itself and PyRosetta from the site's own wheel indexes, as
     it does for a visitor. What it cannot cover is the worker's use of browser
-    APIs — the ``/drive`` file-browser mount, stdin, comms — which is T0043's
-    browser test."""
+    APIs: the ``/drive`` file-browser mount, stdin, comms.
+    ``--jupyterlite-browser-test`` runs the worker itself, and checks the
+    mount."""
     replay = script_dir() / "wasm_jupyterlite_test.mjs"
     if not replay.is_file():
         sys.exit(f"The notebook test script is missing at {replay}")
@@ -2193,6 +2256,146 @@ def run_jupyterlite_test_phase(
     )
 
 
+# Where the REPL cell the JupyterLite browser test sends carries the run token.
+JUPYTERLITE_BROWSER_TEST_TOKEN_SLOT = '"@RUN_TOKEN@"'
+
+# A query string in a request line.
+QUERY_STRING = re.compile(r"\?[^\s\"]*")
+
+
+class JupyterLiteBrowserTestHandler(ReportHandler, JupyterLiteSiteHandler):
+    """Serves the built site to a browser, and takes the reports its kernel
+    posts back."""
+
+    def log_message(self, fmt: str, *fmt_args) -> None:
+        # The REPL's URL carries the test's cell, and the cell carries the run
+        # token, URL-encoded where redact_token cannot find it. So no query
+        # string reaches the log.
+        line = QUERY_STRING.sub("", fmt % fmt_args).translate(
+            CONTROL_CHARACTER_ESCAPES
+        )
+        print(f"    [server] {line}", flush=True)
+
+
+class JupyterLiteBrowserTestServer(ThreadingHTTPServer):
+    """Serves the site on loopback, on a port the OS picks, and hands what the
+    kernel reports to ``results``."""
+
+    daemon_threads = True
+
+    def __init__(self, site: Path, token: str, results: queue.Queue) -> None:
+        super().__init__(
+            ("127.0.0.1", 0),
+            functools.partial(JupyterLiteBrowserTestHandler, directory=str(site)),
+        )
+        self.token = token
+        self.results = results
+
+
+def jupyterlite_browser_test_cell(token: str) -> str:
+    """The REPL cell the JupyterLite browser test runs, carrying ``token``."""
+    cell = (script_dir() / "wasm_jupyterlite_browser_test.ipy").read_text(
+        encoding="utf-8"
+    )
+    # A cell without its slot would post with no token, every post would be
+    # refused, and the run would only end at the timeout.
+    if cell.count(JUPYTERLITE_BROWSER_TEST_TOKEN_SLOT) != 1:
+        sys.exit(
+            f"wasm_jupyterlite_browser_test.ipy must hold "
+            f"{JUPYTERLITE_BROWSER_TEST_TOKEN_SLOT} exactly once, where the "
+            f"run token goes."
+        )
+    # A JSON string is a valid Python string literal.
+    return cell.replace(JUPYTERLITE_BROWSER_TEST_TOKEN_SLOT, json.dumps(token))
+
+
+def jupyterlite_drive_failure(report: dict) -> str | None:
+    """Why a JupyterLite browser run did not mount the file browser, or None
+    if its kernel started in ``/drive``.
+
+    The worker mounts the file browser only if the service worker has
+    registered by the time JupyterLite creates the kernel. JupyterLite reads
+    that without waiting for it, so a registration that loses the race costs
+    a visitor the mount too."""
+    ready = next(
+        (
+            m
+            for m in report.get("marks", [])
+            if isinstance(m, dict) and m.get("name") == "kernel-ready"
+        ),
+        {},
+    )
+    if ready.get("cwd") == "/drive":
+        return None
+    return (
+        f"the kernel started in {ReportHandler.printable(ready.get('cwd'))}, "
+        f"not /drive, so the worker did not mount the file browser"
+    )
+
+
+def run_jupyterlite_browser_test_phase(
+    args: argparse.Namespace,
+    site: Path,
+    chrome_bin: Path,
+) -> None:
+    """Run PyRosetta in the site's own kernel in a real browser, and assert
+    that ``init()`` prints the M1 banner.
+
+    The notebook test replays the kernel worker under Node; this runs the
+    worker itself, beside JupyterLab's UI in one tab. It opens the site's REPL
+    app rather than the notebook, because the REPL runs code given in its URL
+    (``?code=``), where running a notebook's cells would need something to
+    press Run All — a DevTools client or a change to the site. The kernel,
+    and the way the cell installs PyRosetta, are the notebook's.
+
+    What that adds to the notebook test: Pyodide and its packages load from
+    the CDN in a Web Worker, the worker mounts the file browser at ``/drive``
+    through the site's service worker, and the memory figures are a tab's with
+    the REPL app in it. The REPL is the smaller of JupyterLite's apps, so they
+    are not the notebook app's. The phase fails if the kernel did not start in
+    ``/drive``. The verdict is judged on the text the kernel hands the worker as
+    the cell's output — the same boundary the notebook test asserts on — not
+    on what JupyterLab then renders.
+
+    Optional, not the gate: a browser-only verification path is ruled out as
+    one."""
+    # Without its REPL the page would 404, and nothing would report back until
+    # the timeout.
+    if not (site / "repl" / "index.html").is_file():
+        sys.exit(f"The JupyterLite site at {site} has no REPL app to open.")
+    require_chrome_libraries(chrome_bin)
+
+    results: queue.Queue = queue.Queue()
+    token = secrets.token_urlsafe(16)
+    cell = jupyterlite_browser_test_cell(token)
+    server = JupyterLiteBrowserTestServer(site, token, results)
+    site_url = f"http://127.0.0.1:{server.server_address[1]}/"
+    query = urllib.parse.urlencode({"kernel": "python", "code": cell})
+    print(
+        f"==> Serving {site} at {site_url} and opening its REPL on the cell "
+        f"in wasm_jupyterlite_browser_test.ipy"
+    )
+
+    label = "JupyterLite browser test"
+    report, sampler, elapsed, chrome_log = run_page_in_browser(
+        chrome_bin,
+        f"{site_url}repl/index.html?{query}",
+        server,
+        results,
+        "jupyterlite-browser-test",
+        args,
+        label,
+    )
+    judge_browser_run(label, report, sampler, elapsed, chrome_log)
+    failure = jupyterlite_drive_failure(report)
+    if failure:
+        sys.exit(f"{label} FAILED: {failure}.")
+    print(
+        f"{label} PASSED: the site's kernel mounts /drive and initialises "
+        f"PyRosetta in a browser."
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI / main.
 # ---------------------------------------------------------------------------
@@ -2215,7 +2418,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "PyRosetta in a notebook. "
             "Phase 7 (--jupyterlite-test): run that site's notebook through its "
             "own kernel under Node and assert that every cell succeeds and "
-            "prints the M1 banner."
+            "prints the M1 banner. "
+            "Phase 8 (--jupyterlite-browser-test): run PyRosetta in that "
+            "site's kernel in a real browser and assert the same banner."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2290,6 +2495,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "--jupyterlite.",
     )
     parser.add_argument(
+        "--jupyterlite-browser-test", action="store_true",
+        help="Phase 8: build the JupyterLite site, open its REPL in the "
+             "pinned chrome-headless-shell, and have the site's own kernel "
+             "run `%%pip install pyrosetta`, `import pyrosetta` and "
+             "`pyrosetta.init()`; assert the M1 banner and report peak "
+             "browser memory per stage. Optional: --jupyterlite-test is the "
+             "gate. Needs network access and Chrome's system libraries, as "
+             "--browser-test does. Implies --jupyterlite.",
+    )
+    parser.add_argument(
         "--clean", action="store_true",
         help="Remove the WASM build dir for this --type. "
              "Does not touch the native build dir or the toolchain prefix.",
@@ -2299,9 +2514,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="JSON version file (pass-through to inner build.py --version).",
     )
     args = parser.parse_args(argv)
-    # The notebook test always builds the site it tests. A site left over from
+    # The site's tests always build the site they test. A site left over from
     # an earlier run would carry that run's wheel.
-    if args.jupyterlite_test:
+    if args.jupyterlite_test or args.jupyterlite_browser_test:
         args.jupyterlite = True
     return args
 
@@ -2345,6 +2560,8 @@ def main(argv: list[str]) -> int:
         phases.append("JupyterLite site")
     if args.jupyterlite_test:
         phases.append("notebook test (the site's kernel under Node)")
+    if args.jupyterlite_browser_test:
+        phases.append("JupyterLite browser test (chrome-headless-shell)")
     print(f"PyRosetta-WASM toolchain prefix: {prefix}")
     print(f"PyRosetta-WASM build root:       {build_root(args.type)}")
     print(f"Phases to run:                   {', '.join(phases)}")
@@ -2414,6 +2631,11 @@ def main(argv: list[str]) -> int:
     # Phase 7.
     if args.jupyterlite_test:
         run_jupyterlite_test_phase(prefix, emsdk_env, args, site)
+
+    # Phase 8.
+    if args.jupyterlite_browser_test:
+        chrome_bin = install_chrome_headless_shell(prefix)
+        run_jupyterlite_browser_test_phase(args, site, chrome_bin)
 
     return 0
 

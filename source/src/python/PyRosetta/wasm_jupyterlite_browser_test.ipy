@@ -1,0 +1,66 @@
+# Browser end of `build-wasm.py --jupyterlite-browser-test`. The harness opens
+# the site's REPL with this file as its one cell, so the site's own kernel
+# worker runs it in a real browser. It installs PyRosetta as the example
+# notebook does, imports and initialises it, and posts each stage and a verdict
+# back to the harness. The harness puts the run's token in place of @RUN_TOKEN@.
+import json
+import os
+import traceback
+
+import pyodide_js
+import pyodide_kernel
+from pyodide.http import pyfetch
+
+RUN_TOKEN = "@RUN_TOKEN@"
+marks = []
+streamed = []
+
+
+# The verdict is judged on the text the kernel hands the worker as this cell's
+# output, as the notebook test's is. The worker binds these callbacks afresh
+# for every execute request, so wrapping them here lasts for this cell alone.
+def record(forward):
+    def publish(name, text):
+        streamed.append(str(text))
+        forward(name, text)
+
+    return publish
+
+
+for stream in (pyodide_kernel.stdout_stream, pyodide_kernel.stderr_stream):
+    stream.publish_stream_callback = record(stream.publish_stream_callback)
+
+
+async def post(path, **body):
+    await pyfetch(
+        path,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        body=json.dumps({"token": RUN_TOKEN, **body}),
+    )
+
+
+async def mark(name, **detail):
+    # wasm32 addresses at most 4 GB of linear memory, whatever the machine has.
+    detail["wasmHeap"] = pyodide_js._module.HEAPU8.length
+    marks.append({"name": name, **detail})
+    await post("/mark", name=name, detail=detail)
+
+
+error = None
+try:
+    # The working directory says whether the worker mounted the file browser
+    # at /drive, which the harness requires. It does so only where the page can
+    # sync with the file browser, through a service worker or cross-origin
+    # isolation.
+    await mark("kernel-ready", cwd=os.getcwd())
+    %pip install pyrosetta
+    await mark("wheel-installed")
+    import pyrosetta
+    await mark("pyrosetta-imported")
+    pyrosetta.init()
+    await mark("pyrosetta-initialised")
+except BaseException:
+    error = traceback.format_exc()
+    print(error)
+await post("/result", ok=error is None, error=error, marks=marks, output="".join(streamed))

@@ -33,6 +33,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -973,9 +974,242 @@ class ExampleNotebookTest(unittest.TestCase):
                 self.assertIsNone(cell["execution_count"])
 
 
+class JudgeBrowserRunTest(unittest.TestCase):
+    """The verdict on a browser run, shared by both browser phases."""
+
+    def setUp(self):
+        self.sampler = build_wasm.MemorySampler(os.getpid(), time.monotonic())
+
+    def judge(self, report):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as printed:
+            try:
+                build_wasm.judge_browser_run(
+                    "Some browser test",
+                    report,
+                    self.sampler,
+                    1.0,
+                    Path("/nonexistent/chrome.log"),
+                )
+            except SystemExit as raised:
+                return str(raised), printed.getvalue()
+        return None, printed.getvalue()
+
+    def test_passes_a_run_that_printed_the_banner(self):
+        failure, _ = self.judge({"ok": True, "marks": [], "output": BANNER})
+        self.assertIsNone(failure)
+
+    def test_fails_a_run_the_page_reported_as_failed(self):
+        failure, _ = self.judge(
+            {"ok": False, "error": "ImportError: rosetta.so", "output": BANNER}
+        )
+        self.assertIn("Some browser test FAILED", failure)
+        self.assertIn("ImportError: rosetta.so", failure)
+
+    def test_fails_a_run_whose_output_lacks_the_tracer_lines(self):
+        """The box is a Python print, so it can arrive while the C++ tracer's
+        lines never do."""
+        box = "".join(BANNER.splitlines(keepends=True)[:3])
+        failure, _ = self.judge({"ok": True, "output": box})
+        self.assertIn("required substrings are absent", failure)
+        self.assertIn("core.init:", failure)
+
+    def test_page_text_reaches_the_log_without_its_control_characters(self):
+        """Both the output and the error are text the run produced, and either
+        can carry a sequence that rewrites the terminal."""
+        _, printed = self.judge(
+            {"ok": True, "output": BANNER + "\x1b]0;retitled\x07\n"}
+        )
+        self.assertNotIn("\x1b", printed)
+        self.assertIn("\\x1b]0;retitled\\x07\n", printed)
+        failure, _ = self.judge({"ok": False, "error": "line 1\n\x1b[2Jline 2"})
+        self.assertNotIn("\x1b", failure)
+        self.assertIn("line 1\n\\x1b[2Jline 2", failure)
+
+    def test_blanks_a_run_token_in_the_page_error(self):
+        """The M1 page reports a failure as a stack trace, and its frames name
+        the page by the URL that carries the token."""
+        failure, _ = self.judge(
+            {
+                "ok": False,
+                "error": "Error\n    at run (http://127.0.0.1:4/?wheel=w&token=SEKRIT:9)",
+            }
+        )
+        self.assertNotIn("SEKRIT", failure)
+        self.assertIn("token=<redacted>", failure)
+
+    def test_blanks_a_run_token_in_the_page_output(self):
+        _, printed = self.judge(
+            {"ok": True, "output": BANNER + "fetched /?wheel=w&token=SEKRIT\n"}
+        )
+        self.assertNotIn("SEKRIT", printed)
+
+
+class OpenPrivateFileTest(unittest.TestCase):
+    """The browser's log and launch page carry the run token, and the build
+    root is readable by every account on the host."""
+
+    def test_leaves_the_file_readable_by_its_owner_alone(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "chrome.log"
+            with build_wasm.open_private_file(path) as handle:
+                handle.write("token=SEKRIT")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_replaces_a_readable_file_left_by_an_earlier_run(self):
+        """`O_CREAT` keeps an existing file's mode, so the file has to be
+        replaced rather than truncated."""
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "chrome.log"
+            path.write_text("the last run's log")
+            path.chmod(0o644)
+            with build_wasm.open_private_file(path) as handle:
+                handle.write("token=SEKRIT")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.read_text(), "token=SEKRIT")
+
+
+class JupyterLiteDriveFailureTest(unittest.TestCase):
+    """The check that the JupyterLite browser test's kernel mounted /drive."""
+
+    def test_passes_a_kernel_that_started_in_drive(self):
+        report = {"marks": [{"name": "kernel-ready", "cwd": "/drive"}]}
+        self.assertIsNone(build_wasm.jupyterlite_drive_failure(report))
+
+    def test_fails_a_kernel_that_started_elsewhere(self):
+        """Where the worker does not mount the file browser, Pyodide leaves the
+        kernel in its home directory."""
+        report = {"marks": [{"name": "kernel-ready", "cwd": "/home/pyodide"}]}
+        failure = build_wasm.jupyterlite_drive_failure(report)
+        self.assertIn("/home/pyodide", failure)
+        self.assertIn("did not mount the file browser", failure)
+
+    def test_fails_a_run_that_never_reported_where_its_kernel_started(self):
+        report = {"marks": [{"name": "wheel-installed"}]}
+        self.assertIsNotNone(build_wasm.jupyterlite_drive_failure(report))
+
+
+class JupyterLiteBrowserTestServerTest(unittest.TestCase):
+    """The server the JupyterLite browser test opens the site from."""
+
+    TOKEN = "the-run-token"
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        site = Path(scratch.name)
+        (site / "jupyter-lite.json").write_text('{"jupyter-config-data": {}}')
+        self.results = queue.Queue()
+        server = build_wasm.JupyterLiteBrowserTestServer(
+            site, self.TOKEN, self.results
+        )
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    def fetch(self, request):
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as refused:
+            refused.close()
+            return refused.code, b""
+
+    def post(self, path, payload):
+        return self.fetch(
+            urllib.request.Request(
+                self.url + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        )[0]
+
+    def test_serves_the_site(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            status, body = self.fetch(self.url + "/jupyter-lite.json")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"jupyter-config-data": {}}')
+
+    def test_takes_a_report_carrying_the_run_token(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            status = self.post(
+                "/mark", {"token": self.TOKEN, "name": "kernel-ready", "detail": {}}
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.results.get_nowait(), "kernel-ready")
+
+    def test_refuses_a_report_without_the_run_token(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            status = self.post("/result", {"token": "wrong", "ok": True})
+        self.assertEqual(status, 403)
+        self.assertTrue(self.results.empty())
+
+    def test_logs_a_request_without_its_query_string(self):
+        """The REPL's URL carries the cell, and the cell carries the token
+        URL-encoded, where `redact_token` would not find it."""
+        cell = urllib.parse.urlencode({"code": 'RUN_TOKEN = "SEKRIT"'})
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as printed:
+            self.fetch(f"{self.url}/jupyter-lite.json?kernel=python&{cell}")
+        self.assertNotIn("SEKRIT", printed.getvalue())
+        self.assertIn("GET /jupyter-lite.json HTTP", printed.getvalue())
+
+
+class JupyterLiteBrowserTestCellTest(unittest.TestCase):
+    """The REPL cell the JupyterLite browser test sends the site's kernel."""
+
+    def test_carries_the_run_token(self):
+        cell = build_wasm.jupyterlite_browser_test_cell("the-run-token")
+        self.assertIn('RUN_TOKEN = "the-run-token"\n', cell)
+        self.assertNotIn(build_wasm.JUPYTERLITE_BROWSER_TEST_TOKEN_SLOT, cell)
+
+    def test_installs_pyrosetta_the_way_the_example_notebook_does(self):
+        """The test stands for a visitor running the notebook, so it installs
+        PyRosetta with the notebook's own `%pip` line."""
+        notebook = json.loads(
+            (
+                Path(__file__).resolve().parent / "wasm_jupyterlite_example.ipynb"
+            ).read_text(encoding="utf-8")
+        )
+        install = next(
+            "".join(cell["source"])
+            for cell in notebook["cells"]
+            if cell["cell_type"] == "code"
+        )
+        cell = build_wasm.jupyterlite_browser_test_cell("the-run-token")
+        self.assertIn(install, [line.strip() for line in cell.splitlines()])
+
+    def test_refuses_a_cell_with_nowhere_to_put_the_token(self):
+        """Every post from such a cell would be refused, and the run would only
+        end at the timeout, 15 minutes later."""
+        with tempfile.TemporaryDirectory() as scratch:
+            (Path(scratch) / "wasm_jupyterlite_browser_test.ipy").write_text(
+                'RUN_TOKEN = ""\n'
+            )
+            with mock.patch.object(build_wasm, "script_dir", lambda: Path(scratch)):
+                with self.assertRaises(SystemExit):
+                    build_wasm.jupyterlite_browser_test_cell("the-run-token")
+
+    def test_refuses_a_cell_with_two_places_for_the_token(self):
+        """The cell posts from one place. A second copy of the token would sit
+        somewhere else in the cell, such as text it prints into the log."""
+        with tempfile.TemporaryDirectory() as scratch:
+            (Path(scratch) / "wasm_jupyterlite_browser_test.ipy").write_text(
+                'RUN_TOKEN = "@RUN_TOKEN@"\nOTHER = "@RUN_TOKEN@"\n'
+            )
+            with mock.patch.object(build_wasm, "script_dir", lambda: Path(scratch)):
+                with self.assertRaises(SystemExit):
+                    build_wasm.jupyterlite_browser_test_cell("the-run-token")
+
+
 class ParseArgsTest(unittest.TestCase):
     def test_the_notebook_test_builds_the_site_it_tests(self):
         self.assertTrue(build_wasm.parse_args(["--jupyterlite-test"]).jupyterlite)
+
+    def test_the_jupyterlite_browser_test_builds_the_site_it_tests(self):
+        self.assertTrue(
+            build_wasm.parse_args(["--jupyterlite-browser-test"]).jupyterlite
+        )
 
     def test_building_the_site_does_not_run_the_notebook_test(self):
         self.assertFalse(build_wasm.parse_args(["--jupyterlite"]).jupyterlite_test)
