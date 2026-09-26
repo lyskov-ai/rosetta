@@ -146,6 +146,10 @@ def init(options='-ex1 -ex2aro', extra_options='', set_logging_handler=None, not
             "logging" - Register python log handling, do not update logging config.
             True - Register python log handling, make visible if logging isn't configured.
 
+    Under WebAssembly, '-out:file:dont_rewrite_dunbrack_database' is also passed,
+    ahead of options, so that Rosetta does not write its Dunbrack binary cache into
+    the database. Pass '-out:file:dont_rewrite_dunbrack_database false' to write it.
+
     Examples:
         init()                     # uses default flags
         init(extra_options='-pH')  # adds flags to supplement the default
@@ -178,7 +182,16 @@ def init(options='-ex1 -ex2aro', extra_options='', set_logging_handler=None, not
     if isinstance(extra_options, str):
         extra_options = shlex.split(extra_options)
 
-    args = ['PyRosetta'] + options + extra_options
+    args = ['PyRosetta']
+    # In a browser the database sits in Pyodide's in-memory filesystem, which
+    # lasts one session. After reading the Dunbrack libraries from text, Rosetta
+    # writes a 139.5 MB binary copy of them there, which nothing reads before the
+    # session ends. So under WebAssembly the write is off by default, including in
+    # a Pyodide venv under Node, which could have reused the file. The flag goes
+    # first, so that the caller's options can turn it back on.
+    if sys.platform == 'emscripten':
+        args.append('-out:file:dont_rewrite_dunbrack_database')
+    args += options + extra_options
 
     # Attempt to resolve database location from environment if not present, else fallback
     # to rosetta's standard resolution

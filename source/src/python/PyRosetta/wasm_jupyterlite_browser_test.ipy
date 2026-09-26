@@ -1,8 +1,9 @@
 # Browser end of `build-wasm.py --jupyterlite-browser-test`. The harness opens
 # the site's REPL with this file as its one cell, so the site's own kernel
 # worker runs it in a real browser. It installs PyRosetta as the example
-# notebook does, and imports and initialises it. Then it moves a PDB through the
-# file browser's /drive and runs the notebook's cell that fetches one from RCSB.
+# notebook does, imports and initialises it, and scores a peptide. Then it moves
+# a PDB through the file browser's /drive and runs the notebook's cell that
+# fetches one from RCSB.
 # It posts each stage and a verdict back to the harness. The harness puts the
 # run's token in place of @RUN_TOKEN@.
 import json
@@ -62,6 +63,13 @@ try:
     await mark("pyrosetta-imported")
     pyrosetta.init()
     await mark("pyrosetta-initialised")
+
+    # The first score reads the rotamer libraries and the other scoring tables
+    # from the database, as the notebook's does. The round trip below takes a
+    # pose of its own, because a scored pose's PDB names the file it was
+    # written to.
+    scored = pyrosetta.pose_from_sequence("AFILVWYGPSTNQ")
+    await mark("scored", score=pyrosetta.get_score_function()(scored))
 
     # A file the kernel writes to /drive is saved into the file browser's
     # storage by the same call an upload of up to 1 MB makes, and a download

@@ -20,9 +20,10 @@
 //       <package cache dir> <report file> <browser-only tag>
 //
 // Everything a cell prints goes to this script's stdout as it arrives. What
-// each cell did goes to the report file as JSON, one entry per cell run, and
-// the harness judges it. Running stops at the first cell that fails, as a
-// notebook's "Run All" does.
+// each cell did goes to the report file as JSON, one entry per cell run, with
+// the files the session wrote into PyRosetta's database, and the harness judges
+// it. Running stops at the first cell that fails, as a notebook's "Run All"
+// does.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -201,5 +202,28 @@ for (const cell of notebook.cells) {
   if (result.status !== "ok") break;
 }
 
-fs.writeFileSync(reportFile, JSON.stringify({pyodide: pyodide.version, cells}, null, 1));
+// The files the session wrote into PyRosetta's database: those under it that the
+// wheel's RECORD does not list. The kernel's filesystem is in memory, in a
+// browser as here, so each one costs a visitor memory until the kernel restarts.
+// Null if nothing imported PyRosetta. Run in a namespace of its own, so that it
+// leaves the notebook's alone.
+const databaseWrites = toJs(pyodide.runPython(`
+import csv, pathlib, sys
+
+writes = None
+if "pyrosetta" in sys.modules:
+    package = pathlib.Path(sys.modules["pyrosetta"].__file__).parent
+    record, = package.parent.glob("pyrosetta-*.dist-info/RECORD")
+    with record.open(newline="") as lines:
+        installed = {row[0] for row in csv.reader(lines)}
+    writes = sorted(
+        str(path)
+        for path in (package / "database").rglob("*")
+        if path.is_file() and path.relative_to(package.parent).as_posix() not in installed
+    )
+writes
+`, {globals: pyodide.toPy({})})) ?? null;
+
+fs.writeFileSync(
+  reportFile, JSON.stringify({pyodide: pyodide.version, cells, databaseWrites}, null, 1));
 mark("done");

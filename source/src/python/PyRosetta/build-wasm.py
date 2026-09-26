@@ -2120,6 +2120,15 @@ def notebook_report_failure(report: dict) -> str | None:
     JupyterLab's log console, not to the cell. So the two tracer substrings are
     what fail if that routing breaks.
 
+    The session must also have added no file to PyRosetta's database: none
+    that the wheel's ``RECORD`` does not list. A file the wheel shipped and the
+    session rewrote in place would pass. The kernel's filesystem is in memory,
+    in a browser as under the replay, so an added file costs a visitor memory
+    until the kernel restarts. The one PyRosetta
+    wrote before ``init()`` turned it off under WebAssembly was the 139.5 MB
+    Dunbrack binary, written when the notebook first scores. So this check
+    tests something only while the notebook scores.
+
     A failing cell's traceback is code-controlled text headed for a build log,
     so its colour codes are stripped and any other control character escaped,
     as everything else this file prints from a run is."""
@@ -2148,6 +2157,19 @@ def notebook_report_failure(report: dict) -> str | None:
             f"{len(SMOKE_TEST_REQUIRED_OUTPUT)} required substrings are absent "
             f"from what they printed:\n  {listed}"
         )
+    writes = report.get("databaseWrites")
+    if not isinstance(writes, list):
+        return (
+            "the replay did not report which files the session wrote into "
+            "PyRosetta's database"
+        )
+    if writes:
+        listed = "\n  ".join(ReportHandler.printable(path) for path in writes)
+        return (
+            f"the session wrote {len(writes)} file(s) into PyRosetta's "
+            f"database, which a browser holds in memory until the kernel "
+            f"restarts:\n  {listed}"
+        )
     return None
 
 
@@ -2158,8 +2180,8 @@ def run_jupyterlite_test_phase(
     site: Path,
 ) -> None:
     """Run the site's example notebook through the site's own kernel, under
-    Node, and assert that every cell it runs succeeds and PyRosetta prints
-    the M1 banner.
+    Node, and assert that every cell it runs succeeds, PyRosetta prints the M1
+    banner, and the session adds no file to PyRosetta's database.
 
     This is M2's CI gate. The kernel's Web Worker needs a browser, but it only
     starts Pyodide and hands each cell to ``pyodide_kernel``, which needs
@@ -2253,7 +2275,7 @@ def run_jupyterlite_test_phase(
     if result.returncode != 0:
         sys.exit(
             f"Notebook test FAILED: the kernel replay exited "
-            f"{result.returncode} before finishing the notebook; its output "
+            f"{result.returncode} before writing its report; its output "
             f"above has the cause."
         )
     report = json.loads(report_file.read_text(encoding="utf-8"))
@@ -2263,7 +2285,7 @@ def run_jupyterlite_test_phase(
 
     print(
         f"Notebook test PASSED: {JUPYTERLITE_NOTEBOOK} runs in the site's "
-        f"kernel and initialises PyRosetta."
+        f"kernel and initialises PyRosetta, and adds no file to its database."
     )
     skipped = [
         str(cell.get("id"))
@@ -2480,8 +2502,8 @@ def run_jupyterlite_browser_test_phase(
             sys.exit(f"{label} FAILED: {failure}.")
     print(
         f"{label} PASSED: in a browser, the site's kernel mounts /drive, "
-        f"initialises PyRosetta, moves a PDB through /drive both ways, and "
-        f"fetches one from RCSB."
+        f"initialises PyRosetta, scores a peptide, moves a PDB through /drive "
+        f"both ways, and fetches one from RCSB."
     )
 
 

@@ -794,7 +794,8 @@ class NotebookReportFailureTest(unittest.TestCase):
             "cells": [
                 {"id": "install", "status": "ok", "outputs": []},
                 {"id": "init", "status": "ok", "outputs": [stdout(BANNER)]},
-            ]
+            ],
+            "databaseWrites": [],
         }
         self.assertIsNone(build_wasm.notebook_report_failure(report))
 
@@ -803,9 +804,39 @@ class NotebookReportFailureTest(unittest.TestCase):
             "cells": [
                 {"id": "init", "status": "ok", "outputs": [stdout(BANNER)]},
                 {"id": "rcsb", "status": "skipped", "outputs": []},
-            ]
+            ],
+            "databaseWrites": [],
         }
         self.assertIsNone(build_wasm.notebook_report_failure(report))
+
+    def test_names_a_file_the_session_wrote_into_the_database(self):
+        """The kernel's filesystem is in memory, so a cache Rosetta writes
+        there costs a visitor memory for the rest of the session."""
+        binary = (
+            "/lib/python3.13/site-packages/pyrosetta/database/rotamer/"
+            "shapovalov/StpDwn_0-0-0/Dunbrack10.lib.bin"
+        )
+        report = {
+            "cells": [{"id": "score", "status": "ok", "outputs": [stdout(BANNER)]}],
+            "databaseWrites": [binary],
+        }
+        failure = build_wasm.notebook_report_failure(report)
+        self.assertIn("wrote 1 file(s) into PyRosetta's database", failure)
+        self.assertIn(binary, failure)
+
+    def test_fails_a_report_that_does_not_say_what_was_written(self):
+        """A replay that lost the check must not pass as one that found
+        nothing. It reports null when nothing imported PyRosetta."""
+        for writes in ({}, {"databaseWrites": None}):
+            with self.subTest(writes=writes):
+                report = {
+                    "cells": [
+                        {"id": "init", "status": "ok", "outputs": [stdout(BANNER)]}
+                    ],
+                    **writes,
+                }
+                failure = build_wasm.notebook_report_failure(report)
+                self.assertIn("did not report which files", failure)
 
     def test_names_the_cell_that_raised_and_its_exception(self):
         report = {
@@ -875,7 +906,8 @@ class NotebookReportFailureTest(unittest.TestCase):
                     "status": "ok",
                     "outputs": [stdout(line) for line in lines[1:]],
                 },
-            ]
+            ],
+            "databaseWrites": [],
         }
         self.assertIsNone(build_wasm.notebook_report_failure(report))
 
@@ -973,7 +1005,9 @@ class RunJupyterLiteTestPhaseTest(unittest.TestCase):
 
             def replay(argv):
                 report_file = scratch / "jupyterlite-test-report.json"
-                report_file.write_text(json.dumps({"cells": cells}))
+                report_file.write_text(
+                    json.dumps({"cells": cells, "databaseWrites": []})
+                )
                 return mock.Mock(returncode=0)
 
             printed = io.StringIO()
