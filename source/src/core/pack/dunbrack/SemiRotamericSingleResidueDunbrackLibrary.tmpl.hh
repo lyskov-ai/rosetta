@@ -49,6 +49,7 @@
 #include <utility/vectorL.hh>
 #include <utility/io/izstream.hh>
 #include <utility/io/ozstream.hh>
+#include <utility/io/util.hh>
 #include <utility/numbers.hh>
 
 // Numeric Headers
@@ -1658,16 +1659,16 @@ SemiRotamericSingleResidueDunbrackLibrary< T, N >::read_rotameric_data(
 		/// n-o. chi-(1-4) stdev (degrees );
 
 		in_rotameric >> three_letter_code;
-		for ( Size ii = 1; ii <= N; ++ii ) in_rotameric >> bbs[ ii ];
-		in_rotameric >> count;
-		in_rotameric >> rotwell[ 1 ] >> rotwell[ 2 ] >> rotwell[ 3 ] >> rotwell[ 4 ];
-		in_rotameric >> prob;
+		for ( Size ii = 1; ii <= N; ++ii ) utility::io::read_number( in_rotameric.stream(), bbs[ ii ] );
+		utility::io::read_number( in_rotameric.stream(), count );
+		for ( Size ii = 1; ii <= 4; ++ii ) utility::io::read_number( in_rotameric.stream(), rotwell[ ii ] );
+		utility::io::read_number( in_rotameric.stream(), prob );
 		//MaximCode
 		if ( use_shapovalov_ ) {
-			in_rotameric >> minusLogProbability;
+			utility::io::read_number( in_rotameric.stream(), minusLogProbability );
 		}
-		in_rotameric >> mean[ 1 ] >> mean[ 2 ] >> mean[ 3 ] >> mean[ 4 ];
-		in_rotameric >> stdev[ 1 ] >> stdev[ 2 ] >> stdev[ 3 ] >> stdev[ 4 ];
+		for ( Size ii = 1; ii <= 4; ++ii ) utility::io::read_number( in_rotameric.stream(), mean[ ii ] );
+		for ( Size ii = 1; ii <= 4; ++ii ) utility::io::read_number( in_rotameric.stream(), stdev[ ii ] );
 
 		if ( ! in_rotameric ) break; // we've read past the end of the file...
 
@@ -1800,17 +1801,17 @@ SemiRotamericSingleResidueDunbrackLibrary< T, N >::read_bbdep_continuous_minimiz
 		// h... rotameric chi sdevs
 		// i... non-rotameric chi probabilities binned -- sum to 1.
 		in_continmin >> three_letter_code;
-		for ( Size ii = 1; ii <= N; ++ii )                  in_continmin >> bbs[ ii ];
-		in_continmin >> count;
-		for ( Size ii = 1; ii <= T; ++ii )                  in_continmin >> rotwell[ ii ];
-		in_continmin >> base_prob;
+		for ( Size ii = 1; ii <= N; ++ii )                  utility::io::read_number( in_continmin.stream(), bbs[ ii ] );
+		utility::io::read_number( in_continmin.stream(), count );
+		for ( Size ii = 1; ii <= T; ++ii )                  utility::io::read_number( in_continmin.stream(), rotwell[ ii ] );
+		utility::io::read_number( in_continmin.stream(), base_prob );
 		//MaximCode
 		if ( use_shapovalov_ ) {
-			in_continmin >> minusLogProbability;
+			utility::io::read_number( in_continmin.stream(), minusLogProbability );
 		}
-		for ( Size ii = 1; ii <= T; ++ii )                  in_continmin >> chimean[ ii ];
-		for ( Size ii = 1; ii <= T; ++ii )                  in_continmin >> chisd[ ii ];
-		for ( Size ii = 1; ii <= bbdep_nrchi_nbins_; ++ii ) in_continmin >> nrchi_probs[ ii ];
+		for ( Size ii = 1; ii <= T; ++ii )                  utility::io::read_number( in_continmin.stream(), chimean[ ii ] );
+		for ( Size ii = 1; ii <= T; ++ii )                  utility::io::read_number( in_continmin.stream(), chisd[ ii ] );
+		for ( Size ii = 1; ii <= bbdep_nrchi_nbins_; ++ii ) utility::io::read_number( in_continmin.stream(), nrchi_probs[ ii ] );
 
 		if ( ! in_continmin ) break; // we've read past the end of the file...
 		bool cont = false;

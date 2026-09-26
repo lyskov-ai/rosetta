@@ -58,6 +58,7 @@ sources = {
 	"io" : [
 		"izstream",
 		"FileContentsMap",
+		"read_number",
 		"zipstream",
 	],
 	"json": [

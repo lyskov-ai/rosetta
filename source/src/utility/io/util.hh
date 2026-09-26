@@ -17,6 +17,9 @@
 #include <utility/io/ozstream.hh>
 #include <utility/vector1.hh>
 
+#include <cstddef>
+#include <istream>
+
 namespace utility {
 namespace io {
 
@@ -53,6 +56,23 @@ utility::vector1< std::string > get_lines_from_file_data( std::string const & fi
 
 /// @brief  General method for removing comments from a line read from a database file.
 void remove_inline_comments( std::string & line );
+
+/// @brief  Read the next whitespace-separated number from a stream: the value `in >> value` gives.
+/// @details  Under WebAssembly operator>> is slow. libc++ consults the stream's locale for every
+/// character, and musl's strtod computes in software-emulated 128-bit long double. There these read the
+/// token straight from the stream buffer and convert it themselves where that is exact: an integer digit
+/// by digit, and a real number with one IEEE double multiply or divide (Clinger's fast path). Any other
+/// token goes to operator>>. Native builds may use -ffast-math, under which that arithmetic is not
+/// exact, so there these are operator>>.
+///
+/// Under WebAssembly the stream state follows operator>>, with one difference: these always read a whole
+/// token. So "1.5)" fails, where operator>> reads 1.5 and leaves ")" for the next read, and a token that
+/// is not a number is consumed whole. A token over 4,096 characters fails too, with value 0. They assume
+/// the "C" locale's number format and decimal integers, as Rosetta's file streams use. They also ignore
+/// noskipws and do not flush a tied stream.
+std::istream & read_number( std::istream & in, double & value );
+std::istream & read_number( std::istream & in, float & value );
+std::istream & read_number( std::istream & in, std::size_t & value );
 
 }  // namespace io
 }  // namespace utility

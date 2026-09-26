@@ -22,6 +22,7 @@
 #include <basic/Tracer.hh>
 #include <utility/io/izstream.hh>
 #include <utility/io/ozstream.hh>
+#include <utility/io/util.hh>
 
 //Numeric includes
 #include <numeric/angle.functions.hh>
@@ -230,7 +231,7 @@ RotamericSingleResidueDunbrackLibraryParser::read_file(
 		{
 			utility::vector1< core::Real > bb( num_mainchain_torsions_ );
 			for ( Size ii = 1; ii <= num_mainchain_torsions_; ++ii ) {
-				infile >> bb[ ii ];
+				utility::io::read_number( infile.stream(), bb[ ii ] );
 			}
 			backbone_torsions_.push_back(bb);
 		}
@@ -238,17 +239,17 @@ RotamericSingleResidueDunbrackLibraryParser::read_file(
 		// d,e-h,i.  Read count, rotwells, and probability.
 		{
 			core::Size count;
-			infile >> count;
+			utility::io::read_number( infile.stream(), count );
 			counts_.push_back(count);
 
 			utility::vector1< core::Size > rotwells( max_possible_chis_ );
 			for ( core::Size i(1); i<=max_possible_chis_; ++i ) {
-				infile >> rotwells[ i ];
+				utility::io::read_number( infile.stream(), rotwells[ i ] );
 			}
 			rotwells_.push_back(rotwells);
 
 			core::Real probability;
-			infile >> probability;
+			utility::io::read_number( infile.stream(), probability );
 			if ( probability <= MIN_PROBABILITY ) probability = MIN_PROBABILITY;
 			// APL -- On the advice of Roland Dunbrack, modifying the minimum probability to the
 			// resolution of the library.  This helps avoid overwhelmingly unfavorable energies
@@ -261,14 +262,14 @@ RotamericSingleResidueDunbrackLibraryParser::read_file(
 		// iprime.  Read -ln(prob), if this is a Shapovalov file.
 		if ( is_shapovalov_file ) {
 			core::Real minuslnProb;
-			infile >> minuslnProb; //Not actually used for anything, but must be parsed.  Irritating.
+			utility::io::read_number( infile.stream(), minuslnProb ); //Not actually used for anything, but must be parsed.  Irritating.
 		}
 
 		// j-m.  The chimeans.  These are actually important.
 		{
 			utility::vector1< core::Real > chimean( max_possible_chis_ );
 			for ( core::Size i(1); i<=max_possible_chis_; ++i ) {
-				infile >> chimean[i];
+				utility::io::read_number( infile.stream(), chimean[i] );
 			}
 			chimeans_.push_back(chimean);
 		}
@@ -277,7 +278,7 @@ RotamericSingleResidueDunbrackLibraryParser::read_file(
 		{
 			utility::vector1< core::Real > chi_std_devs( max_possible_chis_ );
 			for ( core::Size i(1); i<=max_possible_chis_; ++i ) {
-				infile >> chi_std_devs[i];
+				utility::io::read_number( infile.stream(), chi_std_devs[i] );
 				if ( chi_std_devs[i] <= MIN_CHI_STD_DEV ) chi_std_devs[i] = BOGUS_CHI_STD_DEV; //Avoid inf.
 			}
 			chi_std_devs_.push_back(chi_std_devs);
