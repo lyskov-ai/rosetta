@@ -26,6 +26,10 @@
 
 #include <numeric/types.hh>
 
+#include <utility/thread/backwards_thread_local.hh>
+
+#include <memory>
+
 #ifdef SERIALIZATION
 // Utility serialization headers
 #include <utility/serialization/serialization.hh>
@@ -39,6 +43,20 @@ namespace numeric {
 namespace interpolation {
 namespace spline {
 
+namespace {
+
+/// @brief The inverse CubicSpline::train() computed last, and the grid it belongs to.
+/// @details The inverse is held by pointer, not assigned into a member, because
+/// MathMatrix::operator= frees its storage before allocating the new one: a bad_alloc there
+/// would leave the cache pointing at freed memory under a key that still matches.
+struct LastInverse {
+	int dim = -1;
+	Real delta = 0;
+	BorderFlag border = e_Natural;
+	std::unique_ptr< MathMatrix< Real > const > inverse;
+};
+
+}
 
 //  train CubicSpline
 //  BORDER determines the behavior of the spline at the borders (natural, first derivative, periodic)
@@ -114,7 +132,23 @@ CubicSpline &CubicSpline::train
 	}
 
 	// computation of the second order derivatives in every given point of the spline
-	derivs = coeffs.inverse() * derivs;
+	//
+	// The inverse is cached because inverting coeffs is O(dim^3), yet coeffs depends only on
+	// dim, DELTA and the border condition, never on the values being fitted. BicubicSpline and
+	// PolycubicSpline train thousands of splines on one grid in a row. Loading the Dunbrack 2010
+	// rotamer libraries from text is the costly case: it fits one PolycubicSpline per
+	// semi-rotameric rotamer, and inverting afresh on every call cost 33 s of the 74 s that load
+	// took under WebAssembly. The cached inverse is exactly the one this call would compute, so
+	// the result is bit-for-bit unchanged. Under MULTI_THREADED, THREAD_LOCAL gives each thread
+	// its own cache; other builds assume a single thread, as the rest of Rosetta does.
+	static THREAD_LOCAL LastInverse last;
+	if ( dim != last.dim || DELTA != last.delta || border_ != last.border ) {
+		last.inverse.reset( new MathMatrix< Real >( coeffs.inverse() ) );
+		last.dim = dim;
+		last.delta = DELTA;
+		last.border = border_;
+	}
+	derivs = *last.inverse * derivs;
 	dsecox_ = derivs;
 
 	return *this;
