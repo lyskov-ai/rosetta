@@ -96,7 +96,7 @@ from http.server import (
     ThreadingHTTPServer,
 )
 from pathlib import Path
-from typing import Mapping, NamedTuple
+from typing import Iterable, Mapping, NamedTuple
 
 # ---------------------------------------------------------------------------
 # Pinned toolchain versions (see ADR 0001 section 1).
@@ -276,11 +276,11 @@ def linux_triple() -> str:
     sys.exit(f"Unsupported host architecture for uv: {machine}")
 
 
-def download(url: str, dest: Path) -> None:
+def download(url: str, dest: Path, timeout: float | None = None) -> None:
     print(f"==> Downloading {url}")
     print(f"    -> {dest}", flush=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(url) as resp, open(dest, "wb") as out:
+    with urllib.request.urlopen(url, timeout=timeout) as resp, open(dest, "wb") as out:
         shutil.copyfileobj(resp, out)
 
 
@@ -1187,6 +1187,82 @@ def find_wheel_to_test(wheel_dir: Path) -> Path:
     return wheels[0]
 
 
+# How long the prefetch waits on a connection that sends nothing. Without a
+# limit, a stalled download would hang the phase.
+PREFETCH_TIMEOUT_SECONDS = 60
+
+
+def prefetch_pyodide_packages(
+    lockfile: Path, names: Iterable[str], dest: Path
+) -> set[str]:
+    """Make ``dest`` hold the Pyodide packages ``names`` and their
+    dependencies, each checked against the sha256 ``lockfile`` gives it, and
+    return their file names. A file already in ``dest`` is kept if it matches,
+    and otherwise downloaded from the CDN.
+
+    This is the check Pyodide skips under Node. In a browser it passes the
+    lockfile's digest to ``fetch`` as its ``integrity``, but under Node it calls
+    ``fetch`` without one, and it reads a package back from its package cache
+    unchecked too. So both headless tests fill that cache here, before Node
+    starts.
+
+    The lockfile's keys are normalized project names, but ``depends`` spells a
+    name as its project does (``prompt_toolkit``), so each name is normalized
+    before it is looked up."""
+    packages = json.loads(lockfile.read_text(encoding="utf-8"))["packages"]
+    wanted: dict[str, dict] = {}
+    pending = list(names)
+    while pending:
+        name = re.sub(r"[-_.]+", "-", pending.pop()).lower()
+        if name in wanted:
+            continue
+        if name not in packages:
+            sys.exit(f"{lockfile} has no package named {name!r}")
+        wanted[name] = packages[name]
+        pending.extend(packages[name]["depends"])
+
+    for package in sorted(wanted.values(), key=lambda package: package["file_name"]):
+        target = dest / package["file_name"]
+        if target.is_file():
+            if sha256_of(target) == package["sha256"]:
+                continue
+            target.unlink()
+        # Downloaded under a name the lockfile does not list, so that a
+        # download cut short leaves nothing where Pyodide would read it.
+        partial = target.with_name(target.name + ".part")
+        try:
+            download(
+                f"{PYODIDE_PACKAGE_CDN}/{package['file_name']}",
+                partial,
+                timeout=PREFETCH_TIMEOUT_SECONDS,
+            )
+            actual_sha = sha256_of(partial)
+            if actual_sha != package["sha256"]:
+                sys.exit(
+                    f"SHA256 mismatch for {target.name}, against {lockfile}:\n"
+                    f"  expected: {package['sha256']}\n"
+                    f"  actual:   {actual_sha}"
+                )
+            partial.replace(target)
+        finally:
+            partial.unlink(missing_ok=True)
+    print(f"==> SHA256 verified: {len(wanted)} packages, against {lockfile}")
+    return {package["file_name"] for package in wanted.values()}
+
+
+def pyodide_venv_packages(lockfile: Path) -> list[str]:
+    """The packages ``pyodide venv`` installs with Pyodide's ``loadPackage``:
+    micropip, the unvendored standard library modules and the shared
+    libraries. This is the rule ``_install_stdlib`` applies in pyodide-build's
+    ``out_of_tree/venv.py`` at PYODIDE_BUILD_COMMIT."""
+    packages = json.loads(lockfile.read_text(encoding="utf-8"))["packages"]
+    return ["micropip"] + [
+        name
+        for name, package in packages.items()
+        if package.get("package_type") in ("cpython_module", "shared_library")
+    ]
+
+
 def run_test_phase(
     prefix_root: Path,
     pyodide_venv_bin: Path,
@@ -1236,10 +1312,75 @@ def run_test_phase(
         f"export PATH={shlex.quote(str(pyodide_venv_bin))}:$PATH && "
     )
 
+    # `pyodide venv` installs the packages pyodide_venv_packages names with
+    # Pyodide's loadPackage, under Node, from the cross-build environment's
+    # dist directory. Pyodide reads a package there without checking it, and
+    # downloads one it cannot read from the CDN unchecked and saves it there.
+    # The CLI it runs takes no packageBaseUrl, so the CDN cannot be pointed at
+    # the harness, as it is for the notebook test. So each package is checked
+    # in place first. Afterwards, a package file there that this run did not
+    # check, or that no longer matches, came from the CDN unchecked. By then
+    # Pyodide has loaded the package and run any code in it, so that check
+    # catches a pyodide_venv_packages that has fallen behind pyodide-build,
+    # rather than preventing the load.
+    pyodide_dist = pyodide_browser_dist_dir(prefix_root)
+    lockfile = pyodide_dist / "pyodide-lock.json"
+    checked = prefetch_pyodide_packages(
+        lockfile, pyodide_venv_packages(lockfile), pyodide_dist
+    )
     execute_shell(
-        f"Creating Pyodide venv at {venv_dir} and installing {wheel.name}",
+        f"Creating Pyodide venv at {venv_dir}",
+        preamble + f"pyodide venv {shlex.quote(str(venv_dir))}",
+    )
+    # pyodide-build prefers PYODIDE_ROOT, or a Pyodide source tree above the
+    # working directory, to PYODIDE_XBUILDENV_PATH. Either would give the venv
+    # a Pyodide whose packages nothing here checked.
+    venv_dist = (venv_dir / "bin" / "python").resolve().parent
+    if venv_dist != pyodide_dist.resolve():
+        shutil.rmtree(venv_dir)
+        sys.exit(
+            f"Smoke test FAILED: `pyodide venv` made {venv_dir} on the Pyodide "
+            f"in {venv_dist}, not the one in {pyodide_dist}, whose packages the "
+            f"harness checked. PYODIDE_ROOT, or a Pyodide source tree above "
+            f"the working directory, chooses it."
+        )
+    listed = {
+        package["file_name"]: package["sha256"]
+        for package in json.loads(lockfile.read_text(encoding="utf-8"))[
+            "packages"
+        ].values()
+    }
+    unchecked = sorted(
+        path.name
+        for path in pyodide_dist.iterdir()
+        if path.name in listed
+        and (path.name not in checked or sha256_of(path) != listed[path.name])
+    )
+    if unchecked:
+        for name in unchecked:
+            (pyodide_dist / name).unlink()
+        shutil.rmtree(venv_dir)
+        names = "\n  ".join(unchecked)
+        sys.exit(
+            f"Smoke test FAILED: {pyodide_dist} holds Pyodide packages that "
+            f"the harness did not check against pyodide-lock.json, or that no "
+            f"longer match it, which Pyodide downloads there unchecked:\n"
+            f"  {names}\n"
+            f"They are deleted, with {venv_dir}. If this happens again for a "
+            f"file the harness did not check, `pyodide venv` now installs more "
+            f"than pyodide_venv_packages names: update it to pyodide-build's "
+            f"rule."
+        )
+
+    # The install pulls numpy from jsDelivr, through the package index the
+    # venv's pip.conf names in the cross-build environment. Each link there
+    # carries the lockfile's sha256 as a `#sha256=` fragment, which pip checks.
+    # pip.conf adds that index to PyPI rather than replacing it, but PyPI has
+    # no numpy built for Pyodide. If it ever has a newer one, pip will take
+    # that instead, checked against PyPI's digest rather than the lockfile's.
+    execute_shell(
+        f"Installing {wheel.name} into {venv_dir}",
         preamble
-        + f"pyodide venv {shlex.quote(str(venv_dir))} && "
         + f"{shlex.quote(str(venv_dir / 'bin' / 'pip'))} install "
         + shlex.quote(str(wheel)),
     )
@@ -1974,6 +2115,19 @@ JUPYTERLITE_KERNEL_PLUGIN = "@jupyterlite/pyodide-kernel-extension:kernel"
 # code instead.
 JUPYTERLITE_BROWSER_ONLY_TAG = "browser-only"
 
+# The Pyodide packages the notebook test's kernel loads, by their names in
+# pyodide-lock.json. The replay loads micropip itself. The kernel installs
+# sqlite3, jedi and ipython at start-up; the rest of the replay's
+# `kernelPackages` come from the site's own wheel index. PyRosetta requires
+# numpy. The harness adds their dependencies from the lockfile.
+JUPYTERLITE_TEST_PYODIDE_PACKAGES = ("micropip", "sqlite3", "jedi", "ipython", "numpy")
+
+# Where the notebook test's replay tells Pyodide to download a package that is
+# missing from its package cache. The harness's server answers every request
+# there with a 404 and records it, because each one is a package the prefetch
+# missed.
+PREFETCH_MISS_PATH = "/pyodide-package-not-prefetched/"
+
 
 def jupyterlite_site_dir(build_type: str) -> Path:
     """Where the JupyterLite site is built. Written by the site phase and
@@ -2098,6 +2252,33 @@ class JupyterLiteSiteHandler(SimpleHTTPRequestHandler):
         print(f"    [server] {line}", flush=True)
 
 
+class JupyterLiteTestHandler(JupyterLiteSiteHandler):
+    """Serves the site to the notebook test, and turns away every request for a
+    package the prefetch missed, recording its file name on the server."""
+
+    def do_GET(self) -> None:
+        path = urllib.parse.urlparse(self.path).path
+        if path.startswith(PREFETCH_MISS_PATH):
+            self.server.missed_packages.append(path[len(PREFETCH_MISS_PATH) :])
+            self.send_error(404, "not prefetched")
+            return
+        super().do_GET()
+
+
+class JupyterLiteTestServer(ThreadingHTTPServer):
+    """Serves the site on loopback, on a port the OS picks, and collects the
+    file names of the packages the prefetch missed in ``missed_packages``."""
+
+    daemon_threads = True
+
+    def __init__(self, site: Path) -> None:
+        super().__init__(
+            ("127.0.0.1", 0),
+            functools.partial(JupyterLiteTestHandler, directory=str(site)),
+        )
+        self.missed_packages: list[str] = []
+
+
 # Colour codes, which IPython puts throughout a traceback.
 ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -2188,7 +2369,9 @@ def run_jupyterlite_test_phase(
     nothing a browser has. ``wasm_jupyterlite_test.mjs`` makes the worker's
     calls in the worker's order, against the site served on loopback, so the
     kernel installs itself and PyRosetta from the site's own wheel indexes, as
-    it does for a visitor. What it cannot cover is the worker's use of browser
+    it does for a visitor. Pyodide's own packages come from a cache the harness
+    fills first, checking each against the lockfile, because Pyodide under Node
+    checks nothing it loads. What it cannot cover is the worker's use of browser
     APIs: the ``/drive`` file-browser mount, stdin, comms. So it skips a cell
     tagged ``JUPYTERLITE_BROWSER_ONLY_TAG`` and names it when the run passes.
     ``--jupyterlite-browser-test`` runs the worker itself: it checks the mount,
@@ -2227,22 +2410,23 @@ def run_jupyterlite_test_phase(
             f"stands in only for {expected_pyodide!r}."
         )
 
-    # Pyodide under Node saves every package it downloads here. Emptied each
-    # run: Node reads a cached package back without checking its digest.
+    # The replay's package cache, which Pyodide under Node reads without
+    # checking a digest. Emptied each run, so that everything in it was checked
+    # by this run.
     package_cache = build_root(args.type) / "jupyterlite-test-packages"
     if package_cache.exists():
         shutil.rmtree(package_cache)
     package_cache.mkdir(parents=True)
+    prefetch_pyodide_packages(
+        pyodide_dist / "pyodide-lock.json",
+        JUPYTERLITE_TEST_PYODIDE_PACKAGES,
+        package_cache,
+    )
     report_file = build_root(args.type) / "jupyterlite-test-report.json"
     report_file.unlink(missing_ok=True)
 
-    # Port 0 lets the OS pick a free port; loopback keeps the site off the
-    # network.
-    server = ThreadingHTTPServer(
-        ("127.0.0.1", 0),
-        functools.partial(JupyterLiteSiteHandler, directory=str(site)),
-    )
-    server.daemon_threads = True
+    # Loopback keeps the site off the network.
+    server = JupyterLiteTestServer(site)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     site_url = f"http://127.0.0.1:{server.server_address[1]}/"
 
@@ -2259,6 +2443,7 @@ def run_jupyterlite_test_phase(
                 site_url,
                 JUPYTERLITE_NOTEBOOK,
                 package_cache,
+                urllib.parse.urljoin(site_url, PREFETCH_MISS_PATH),
                 report_file,
                 JUPYTERLITE_BROWSER_ONLY_TAG,
             )
@@ -2272,6 +2457,22 @@ def run_jupyterlite_test_phase(
         server.shutdown()
         server.server_close()
 
+    # Checked first, because a package that did not load can also stop the
+    # replay. Pyodide's loadPackage only logs a package it failed to load, so
+    # a refused download alone would not fail the run.
+    if server.missed_packages:
+        listed = "\n  ".join(
+            name.translate(CONTROL_CHARACTER_ESCAPES)
+            for name in sorted(set(server.missed_packages))
+        )
+        sys.exit(
+            f"Notebook test FAILED: Pyodide went to its CDN for these packages, "
+            f"which the harness had not checked against pyodide-lock.json, and "
+            f"was refused:\n  {listed}\n"
+            f"Add the package that loads them to JUPYTERLITE_TEST_PYODIDE_PACKAGES, "
+            f"by its name in pyodide-lock.json. Its dependencies follow from the "
+            f"lockfile."
+        )
     if result.returncode != 0:
         sys.exit(
             f"Notebook test FAILED: the kernel replay exited "
@@ -2579,6 +2780,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Phase 4: run the headless smoke test. Installs the wheel into "
              "a throwaway Pyodide venv under the build root and asserts that "
              "`import pyrosetta; pyrosetta.init()` prints the M1 banner. "
+             "Checks the Pyodide packages the venv installs against Pyodide's "
+             "lockfile first, downloading any that are missing. "
              "Pass both --skip flags to test an already-built wheel.",
     )
     parser.add_argument(
@@ -2607,7 +2810,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "prints the M1 banner. Skips, and names, any cell tagged "
              f"{JUPYTERLITE_BROWSER_ONLY_TAG}, which --jupyterlite-browser-test "
              "runs instead. Needs network access: Pyodide's own packages come "
-             "from jsDelivr, as they do for a visitor. Implies --jupyterlite.",
+             "from jsDelivr, as they do for a visitor, and each is checked "
+             "against Pyodide's lockfile before the kernel starts. Implies "
+             "--jupyterlite.",
     )
     parser.add_argument(
         "--jupyterlite-browser-test", action="store_true",

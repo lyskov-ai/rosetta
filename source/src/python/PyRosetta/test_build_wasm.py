@@ -30,6 +30,7 @@ import json
 import os
 import queue
 import shlex
+import socket
 import tempfile
 import textwrap
 import threading
@@ -955,6 +956,307 @@ class JupyterLiteBuildEnvTest(unittest.TestCase):
         self.assertEqual(env["HOME"], "/root")
 
 
+class PrefetchPyodidePackagesTest(unittest.TestCase):
+    """The headless tests' check of the Pyodide packages Node loads. Only
+    ``--test`` finds files already in the cache: the notebook test empties its
+    cache first."""
+
+    def prefetch(self, lockfile_packages, names, served, already=None):
+        """Prefetch ``names`` against a lockfile listing ``lockfile_packages``,
+        from a stand-in CDN serving ``served``, a file name to bytes map, into
+        a cache that starts out holding ``already``, another such map. Where
+        ``served`` maps a name to an exception instead, the download writes a
+        few bytes and then raises it. Returns the URLs downloaded, the cache's
+        files and their bytes, and what the prefetch returned or raised."""
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch = Path(scratch)
+            lockfile = scratch / "pyodide-lock.json"
+            lockfile.write_text(json.dumps({"info": {}, "packages": lockfile_packages}))
+            dest = scratch / "cache"
+            dest.mkdir()
+            for name, payload in (already or {}).items():
+                (dest / name).write_bytes(payload)
+            downloaded = []
+
+            def download(url, target, timeout):
+                downloaded.append(url)
+                name = url.rsplit("/", 1)[1]
+                payload = served[name]
+                target.write_bytes(
+                    b"the first few bytes" if isinstance(payload, Exception) else payload
+                )
+                # Pyodide may read the package's own name at any moment.
+                self.assertFalse((dest / name).exists(), "downloaded where Pyodide reads")
+                if isinstance(payload, Exception):
+                    raise payload
+
+            with mock.patch.object(
+                build_wasm, "download", side_effect=download
+            ), mock.patch("sys.stdout", new_callable=io.StringIO):
+                try:
+                    outcome = build_wasm.prefetch_pyodide_packages(lockfile, names, dest)
+                except (SystemExit, Exception) as raised:
+                    outcome = raised
+            left = {path.name: path.read_bytes() for path in dest.iterdir()}
+        return downloaded, left, outcome
+
+    @staticmethod
+    def package(file_name, payload, depends=()):
+        return {
+            "file_name": file_name,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "depends": list(depends),
+        }
+
+    def test_fetches_the_packages_named_and_their_dependencies(self):
+        """``depends`` spells a name as its project does, where the lockfile
+        keys it normalized."""
+        downloaded, left, checked = self.prefetch(
+            {
+                "ipython": self.package("ipython.whl", b"i", ["Prompt_Toolkit", "six"]),
+                "prompt-toolkit": self.package("prompt_toolkit.whl", b"p", ["six"]),
+                "six": self.package("six.whl", b"s"),
+                "numpy": self.package("numpy.whl", b"n"),
+            },
+            ["ipython"],
+            {"ipython.whl": b"i", "prompt_toolkit.whl": b"p", "six.whl": b"s"},
+        )
+        self.assertEqual(checked, {"ipython.whl", "prompt_toolkit.whl", "six.whl"})
+        self.assertEqual(
+            downloaded,
+            [
+                f"{build_wasm.PYODIDE_PACKAGE_CDN}/ipython.whl",
+                f"{build_wasm.PYODIDE_PACKAGE_CDN}/prompt_toolkit.whl",
+                f"{build_wasm.PYODIDE_PACKAGE_CDN}/six.whl",
+            ],
+        )
+        self.assertEqual(
+            left, {"ipython.whl": b"i", "prompt_toolkit.whl": b"p", "six.whl": b"s"}
+        )
+
+    def test_keeps_a_cached_file_that_matches_the_lockfile(self):
+        downloaded, left, checked = self.prefetch(
+            {"numpy": self.package("numpy.whl", b"n")},
+            ["numpy"],
+            {},
+            already={"numpy.whl": b"n"},
+        )
+        self.assertEqual(checked, {"numpy.whl"})
+        self.assertEqual(downloaded, [])
+        self.assertEqual(left, {"numpy.whl": b"n"})
+
+    def test_replaces_a_cached_file_that_does_not_match_the_lockfile(self):
+        """Pyodide under Node would load the cached file without checking it."""
+        downloaded, left, checked = self.prefetch(
+            {"numpy": self.package("numpy.whl", b"the real numpy")},
+            ["numpy"],
+            {"numpy.whl": b"the real numpy"},
+            already={"numpy.whl": b"something else"},
+        )
+        self.assertEqual(checked, {"numpy.whl"})
+        self.assertEqual(downloaded, [f"{build_wasm.PYODIDE_PACKAGE_CDN}/numpy.whl"])
+        self.assertEqual(left, {"numpy.whl": b"the real numpy"})
+
+    def test_leaves_no_unchecked_file_when_a_download_breaks_off(self):
+        """Neither the stale cached copy nor the bytes that did arrive may be
+        left where Pyodide would read them."""
+        _, left, raised = self.prefetch(
+            {"numpy": self.package("numpy.whl", b"the real numpy")},
+            ["numpy"],
+            {"numpy.whl": TimeoutError("the CDN stopped sending")},
+            already={"numpy.whl": b"something else"},
+        )
+        self.assertIsInstance(raised, TimeoutError)
+        self.assertEqual(left, {})
+
+    def test_refuses_a_package_whose_digest_is_not_the_lockfiles(self):
+        _, left, refused = self.prefetch(
+            {"numpy": self.package("numpy.whl", b"the real numpy")},
+            ["numpy"],
+            {"numpy.whl": b"something else"},
+        )
+        self.assertIn("SHA256 mismatch for numpy.whl", str(refused))
+        self.assertEqual(left, {}, "Pyodide would load it unchecked")
+
+    def test_refuses_a_name_the_lockfile_does_not_list(self):
+        downloaded, _, refused = self.prefetch(
+            {"numpy": self.package("numpy.whl", b"n")}, ["scipy"], {}
+        )
+        self.assertIn("no package named 'scipy'", str(refused))
+        self.assertEqual(downloaded, [])
+
+    def test_gives_up_on_a_cdn_that_never_answers(self):
+        """A stalled download must fail the gate rather than hang it."""
+        stalled = socket.create_server(("127.0.0.1", 0))
+        self.addCleanup(stalled.close)
+        cdn = f"http://127.0.0.1:{stalled.getsockname()[1]}"
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch = Path(scratch)
+            lockfile = scratch / "pyodide-lock.json"
+            lockfile.write_text(json.dumps(
+                {"info": {}, "packages": {"numpy": self.package("numpy.whl", b"n")}}
+            ))
+            started = time.monotonic()
+            with mock.patch.object(
+                build_wasm, "PYODIDE_PACKAGE_CDN", cdn
+            ), mock.patch.object(
+                build_wasm, "PREFETCH_TIMEOUT_SECONDS", 0.5
+            ), mock.patch("sys.stdout", new_callable=io.StringIO):
+                with self.assertRaises((TimeoutError, urllib.error.URLError)):
+                    build_wasm.prefetch_pyodide_packages(lockfile, ["numpy"], scratch)
+        self.assertLess(time.monotonic() - started, 10)
+
+
+class PyodideVenvPackagesTest(unittest.TestCase):
+    def test_names_micropip_the_unvendored_stdlib_and_the_shared_libraries(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            lockfile = Path(scratch) / "pyodide-lock.json"
+            lockfile.write_text(json.dumps({"info": {}, "packages": {
+                "micropip": {"package_type": "package"},
+                "numpy": {"package_type": "package"},
+                "ssl": {"package_type": "cpython_module"},
+                "libopenssl": {"package_type": "shared_library"},
+            }}))
+            names = build_wasm.pyodide_venv_packages(lockfile)
+        self.assertEqual(sorted(names), ["libopenssl", "micropip", "ssl"])
+
+
+class RunTestPhaseTest(unittest.TestCase):
+    """The checks around the smoke test's Pyodide venv."""
+
+    def run_phase(self, left_in_dist=(), downloaded_by_venv=(), venv_on=None):
+        """Run the phase against a scratch cross-build environment whose
+        lockfile gives every package the digest of an empty file, with
+        stand-ins for the prefetch, which reports micropip.whl, ssl.whl and
+        libopenssl.zip checked, and for the shell steps. ``left_in_dist`` starts
+        out in the dist directory, as empty files. The venv step writes
+        ``downloaded_by_venv``, a file name to bytes map, there, and makes the
+        venv on the Pyodide in ``venv_on``, a directory name under the scratch
+        directory, or on dist if None. Returns the dist
+        directory, the shell steps run, the prefetch's arguments, the dist
+        directory's files afterwards, whether the venv survived, and the
+        SystemExit raised, if any."""
+        with tempfile.TemporaryDirectory() as scratch:
+            scratch = Path(scratch)
+            dist = scratch / "dist"
+            dist.mkdir()
+            (dist / "python").write_text("")
+            empty = hashlib.sha256(b"").hexdigest()
+            (dist / "pyodide-lock.json").write_text(json.dumps({"info": {}, "packages": {
+                "micropip": {"file_name": "micropip.whl", "package_type": "package",
+                             "sha256": empty},
+                "ssl": {"file_name": "ssl.whl", "package_type": "cpython_module",
+                        "sha256": empty},
+                "libopenssl": {"file_name": "libopenssl.zip",
+                               "package_type": "shared_library", "sha256": empty},
+                "extra": {"file_name": "extra.whl", "package_type": "package",
+                          "sha256": empty},
+            }}))
+            for name in left_in_dist:
+                (dist / name).write_bytes(b"")
+            venv = scratch / "test-venv"
+            steps = []
+
+            def shell(description, command):
+                steps.append(description)
+                if "pyodide venv" in command:
+                    runtime = scratch / venv_on if venv_on else dist
+                    runtime.mkdir(exist_ok=True)
+                    (runtime / "python").write_text("")
+                    (venv / "bin").mkdir(parents=True)
+                    (venv / "bin" / "python").symlink_to(runtime / "python")
+                    for name, payload in dict(downloaded_by_venv).items():
+                        (dist / name).write_bytes(payload)
+
+            def prefetch(lockfile, names, dest):
+                steps.append("prefetch")
+                return {"micropip.whl", "ssl.whl", "libopenssl.zip"}
+
+            smoke = mock.Mock(returncode=0, stdout=BANNER, stderr="")
+            with mock.patch.object(
+                build_wasm, "pyodide_browser_dist_dir", lambda prefix: dist
+            ), mock.patch.object(
+                build_wasm, "build_root", lambda build_type: scratch
+            ), mock.patch.object(
+                build_wasm, "prefetch_pyodide_packages", side_effect=prefetch
+            ) as prefetched, mock.patch.object(
+                build_wasm, "execute_shell", side_effect=shell
+            ), mock.patch.object(
+                build_wasm.subprocess, "run", return_value=smoke
+            ), mock.patch("sys.stdout", new_callable=io.StringIO):
+                try:
+                    build_wasm.run_test_phase(
+                        scratch,
+                        scratch / "bin",
+                        scratch / "emsdk_env.sh",
+                        mock.Mock(type="Release"),
+                        scratch / "pyrosetta.whl",
+                    )
+                    refused = None
+                except SystemExit as raised:
+                    refused = raised
+            return {
+                "dist": dist,
+                "steps": steps,
+                "prefetched": prefetched.call_args.args,
+                "left": sorted(path.name for path in dist.iterdir()),
+                "venv_survived": venv.exists(),
+                "refused": refused,
+            }
+
+    def test_checks_the_venvs_packages_in_dist_before_making_the_venv(self):
+        run = self.run_phase()
+        self.assertIsNone(run["refused"])
+        self.assertEqual(run["steps"][0], "prefetch")
+        self.assertTrue(run["steps"][1].startswith("Creating Pyodide venv"))
+        lockfile, names, dest = run["prefetched"]
+        self.assertEqual(lockfile, run["dist"] / "pyodide-lock.json")
+        self.assertEqual(sorted(names), ["libopenssl", "micropip", "ssl"])
+        self.assertEqual(dest, run["dist"])
+
+    def test_fails_when_the_venv_step_downloads_a_package_unchecked(self):
+        run = self.run_phase(downloaded_by_venv={"extra.whl": b""})
+        self.assertIn("Smoke test FAILED", str(run["refused"]))
+        self.assertIn("\n  extra.whl\n", str(run["refused"]))
+        self.assertEqual(run["left"], ["pyodide-lock.json", "python"])
+        self.assertFalse(run["venv_survived"], "the venv holds the unchecked package")
+        self.assertEqual(len(run["steps"]), 2, "pip must not run in that venv")
+
+    def test_fails_when_a_checked_package_changed_during_the_venv_step(self):
+        """Pyodide also goes to the CDN when it cannot read a file, and saves
+        what it gets over the file."""
+        run = self.run_phase(
+            left_in_dist=["ssl.whl"], downloaded_by_venv={"ssl.whl": b"from the CDN"}
+        )
+        self.assertIn("\n  ssl.whl\n", str(run["refused"]))
+        self.assertEqual(run["left"], ["pyodide-lock.json", "python"])
+
+    def test_fails_on_an_unchecked_package_an_earlier_run_left(self):
+        """Pyodide reads a package already in dist without checking it, so a
+        file an earlier run downloaded unchecked is as bad as a new one."""
+        run = self.run_phase(left_in_dist=["extra.whl"])
+        self.assertIn("\n  extra.whl\n", str(run["refused"]))
+        self.assertEqual(run["left"], ["pyodide-lock.json", "python"])
+
+    def test_leaves_the_checked_packages_and_other_files_alone(self):
+        run = self.run_phase(left_in_dist=["micropip.whl", "libopenssl.zip", "pyodide.asm.js"])
+        self.assertIsNone(run["refused"])
+        self.assertEqual(
+            run["left"],
+            ["libopenssl.zip", "micropip.whl", "pyodide-lock.json", "pyodide.asm.js", "python"],
+        )
+        self.assertTrue(run["venv_survived"])
+
+    def test_fails_when_the_venv_runs_on_another_pyodide(self):
+        """PYODIDE_ROOT, or a Pyodide source tree above the working
+        directory, overrides the cross-build environment the harness checked."""
+        run = self.run_phase(venv_on="other-pyodide")
+        self.assertIn("Smoke test FAILED", str(run["refused"]))
+        self.assertIn("other-pyodide", str(run["refused"]))
+        self.assertFalse(run["venv_survived"])
+        self.assertEqual(len(run["steps"]), 2, "pip must not run in that venv")
+
+
 class RunJupyterLiteTestPhaseTest(unittest.TestCase):
     def test_refuses_a_site_whose_kernel_names_another_pyodide(self):
         """The replay runs the cross-build environment's Pyodide in place of
@@ -980,18 +1282,23 @@ class RunJupyterLiteTestPhaseTest(unittest.TestCase):
                 build_wasm, "pyodide_browser_dist_dir", lambda prefix: dist
             ), mock.patch.object(
                 build_wasm, "build_root", lambda build_type: scratch
-            ), mock.patch.object(build_wasm.subprocess, "run") as run:
+            ), mock.patch.object(
+                build_wasm, "prefetch_pyodide_packages"
+            ) as prefetch, mock.patch.object(build_wasm.subprocess, "run") as run:
                 with self.assertRaises(SystemExit) as raised:
                     build_wasm.run_jupyterlite_test_phase(
                         scratch, scratch / "emsdk_env.sh", mock.Mock(type="Release"), site
                     )
+            prefetch.assert_not_called()
             run.assert_not_called()
         self.assertIn("./static/pyodide/pyodide.js", str(raised.exception))
 
-    def run_phase_with_replay_report(self, cells):
+    def run_phase_with_replay_report(self, cells, during_replay=None):
         """Run the phase against a scratch site, with a stand-in replay that
-        writes ``cells`` as its report. Returns the replay's command line and
-        what the phase printed."""
+        writes ``cells`` as its report, and a stand-in prefetch that writes
+        ``checked.whl`` into the package cache. ``during_replay``, if given, is
+        called with the replay's arguments while the site is served. Returns
+        the replay's command line and what the phase printed."""
         with tempfile.TemporaryDirectory() as scratch:
             scratch = Path(scratch)
             dist = scratch / "dist"
@@ -1003,7 +1310,14 @@ class RunJupyterLiteTestPhaseTest(unittest.TestCase):
                 json.dumps(build_wasm.jupyterlite_config())
             )
 
+            def prefetch(lockfile, names, dest):
+                (dest / "checked.whl").write_bytes(b"")
+
             def replay(argv):
+                if during_replay:
+                    words = shlex.split(argv[2])
+                    replay_script = str(build_wasm.script_dir() / "wasm_jupyterlite_test.mjs")
+                    during_replay(words[words.index(replay_script) + 1 :])
                 report_file = scratch / "jupyterlite-test-report.json"
                 report_file.write_text(
                     json.dumps({"cells": cells, "databaseWrites": []})
@@ -1016,12 +1330,45 @@ class RunJupyterLiteTestPhaseTest(unittest.TestCase):
             ), mock.patch.object(
                 build_wasm, "build_root", lambda build_type: scratch
             ), mock.patch.object(
+                build_wasm, "prefetch_pyodide_packages", side_effect=prefetch
+            ), mock.patch.object(
                 build_wasm.subprocess, "run", side_effect=replay
             ) as run, contextlib.redirect_stdout(printed):
                 build_wasm.run_jupyterlite_test_phase(
                     scratch, scratch / "emsdk_env.sh", mock.Mock(type="Release"), site
                 )
         return run.call_args.args[0][2], printed.getvalue()
+
+    def test_the_replay_reads_the_cache_the_prefetch_filled(self):
+        """Pyodide under Node checks nothing it loads, so the replay must read
+        its packages from where the harness just checked them."""
+        cached = []
+        self.run_phase_with_replay_report(
+            [{"id": "init", "status": "ok", "outputs": [stdout(BANNER)]}],
+            during_replay=lambda arguments: cached.extend(
+                path.name for path in Path(arguments[3]).iterdir()
+            ),
+        )
+        self.assertEqual(cached, ["checked.whl"])
+
+    def test_fails_a_run_that_asked_for_a_package_the_prefetch_missed(self):
+        """Pyodide only logs a package it could not load, so the refusal
+        alone would not fail a run in which nothing imported it."""
+
+        def ask_for_a_package(arguments):
+            miss_url = arguments[4]
+            with self.assertRaises(urllib.error.HTTPError) as refused:
+                urllib.request.urlopen(miss_url + "extra-1.0-py3-none-any.whl", timeout=10)
+            refused.exception.close()
+            self.assertEqual(refused.exception.code, 404)
+
+        with self.assertRaises(SystemExit) as raised:
+            self.run_phase_with_replay_report(
+                [{"id": "init", "status": "ok", "outputs": [stdout(BANNER)]}],
+                during_replay=ask_for_a_package,
+            )
+        self.assertIn("Notebook test FAILED", str(raised.exception))
+        self.assertIn("\n  extra-1.0-py3-none-any.whl\n", str(raised.exception))
 
     def test_tells_the_replay_which_tag_to_skip(self):
         command, _ = self.run_phase_with_replay_report(
@@ -1296,6 +1643,44 @@ class JupyterLiteFilesFailureTest(unittest.TestCase):
             files_report(fetched={"residues": 0})
         )
         self.assertIn("loaded 0 residues", failure)
+
+
+class JupyterLiteTestServerTest(unittest.TestCase):
+    """The server the notebook test serves the site from."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        site = Path(scratch.name)
+        (site / "jupyter-lite.json").write_text('{"jupyter-config-data": {}}')
+        self.server = build_wasm.JupyterLiteTestServer(site)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def fetch(self, url):
+        try:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as refused:
+            refused.close()
+            return refused.code, b""
+
+    def test_serves_the_site(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            status, body = self.fetch(self.url + "/jupyter-lite.json")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"jupyter-config-data": {}}')
+        self.assertEqual(self.server.missed_packages, [])
+
+    def test_refuses_and_records_a_package_the_prefetch_missed(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            status, _ = self.fetch(
+                self.url + build_wasm.PREFETCH_MISS_PATH + "numpy-2.2.5.whl"
+            )
+        self.assertEqual(status, 404)
+        self.assertEqual(self.server.missed_packages, ["numpy-2.2.5.whl"])
 
 
 class JupyterLiteBrowserTestServerTest(unittest.TestCase):

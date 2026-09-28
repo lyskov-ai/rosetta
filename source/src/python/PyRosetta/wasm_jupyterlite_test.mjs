@@ -17,7 +17,7 @@
 // them together with the kernel pin in wasm_jupyterlite_requirements.txt.
 //
 //   node wasm_jupyterlite_test.mjs <pyodide dist> <site URL> <notebook>
-//       <package cache dir> <report file> <browser-only tag>
+//       <package cache dir> <package miss URL> <report file> <browser-only tag>
 //
 // Everything a cell prints goes to this script's stdout as it arrives. What
 // each cell did goes to the report file as JSON, one entry per cell run, with
@@ -28,11 +28,12 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const [distDir, siteUrl, notebookPath, packageCacheDir, reportFile, browserOnlyTag] =
-  process.argv.slice(2);
+const [
+  distDir, siteUrl, notebookPath, packageCacheDir, packageMissUrl, reportFile, browserOnlyTag,
+] = process.argv.slice(2);
 if (!browserOnlyTag) {
-  console.error("usage: node wasm_jupyterlite_test.mjs <pyodide dist> " +
-    "<site URL> <notebook> <package cache dir> <report file> <browser-only tag>");
+  console.error("usage: node wasm_jupyterlite_test.mjs <pyodide dist> <site URL> " +
+    "<notebook> <package cache dir> <package miss URL> <report file> <browser-only tag>");
   process.exit(2);
 }
 
@@ -89,8 +90,12 @@ for (const [key, value] of Object.entries(loadPyodideOptions)) {
 // release on the CDN; Node cannot import a module over HTTPS, so this loads the
 // same release from the cross-build environment, whose runtime files are
 // byte-identical to the CDN's (ADR 0006). `packageCacheDir` is Node-only: under
-// Node, Pyodide saves every package it downloads, and without a directory of
-// its own it saves them beside `pyodide.mjs`, inside the toolchain.
+// Node, Pyodide loads a package from that directory if it is there. Otherwise
+// it downloads the package from its CDN, whose address it takes from
+// `packageBaseUrl`, and saves it there. It checks the digest in neither case.
+// So the harness fills the directory with the packages the kernel needs, each
+// checked against the lockfile, and the miss URL points at the harness's own
+// server, which refuses every download and fails the run.
 const {loadPyodide} = await import(path.join(distDir, "pyodide.mjs"));
 const pyodide = await loadPyodide({
   indexURL: distDir + path.sep,
@@ -99,8 +104,9 @@ const pyodide = await loadPyodide({
   stdout: (line) => console.log(`[pyodide] ${line}`),
   stderr: (line) => console.log(`[pyodide] ${line}`),
   ...loadPyodideOptions,
-  // Last, so that nothing in the site's settings can move it.
+  // Last, so that nothing in the site's settings can move them.
   packageCacheDir: packageCacheDir + path.sep,
+  packageBaseUrl: packageMissUrl,
 });
 mark(`Pyodide ${pyodide.version} booted`);
 
