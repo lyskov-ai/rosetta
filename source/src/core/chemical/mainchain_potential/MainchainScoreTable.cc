@@ -47,6 +47,22 @@ namespace mainchain_potential {
 
 static basic::Tracer TR("core.chemical.mainchain_potential.MainchainScoreTable");
 
+namespace {
+
+/// @brief The most grid points a map may give one mainchain torsion: one per degree.
+/// @details Fitting a periodic cubic spline to n points inverts an n-by-n matrix, at O(n^3).
+/// That bounds each inversion, not how many a fit runs: CubicSpline::train keeps only its last
+/// inverse, so a grid whose torsions differ in size can invert once per row.
+core::Size const max_points_per_torsion( 360 );
+
+/// @brief The most values the spline fitted to a map may store: 256 MiB of doubles.
+/// @details The spline stores 2^N values for each point of an N-dimensional grid.  Bounding
+/// that, and not only each torsion, also keeps a grid of up to nine torsions from wrapping a
+/// 32-bit size_t, as 256^4 points would under WebAssembly.
+core::Size const max_spline_values( core::Size( 1 ) << 25 );
+
+}
+
 /// @brief Default constructor.
 ///
 MainchainScoreTable::MainchainScoreTable():
@@ -172,9 +188,14 @@ MainchainScoreTable::parse_rama_map_file_shapovalov(
 			} else if ( linehead == "@DIMENSIONS" ) {
 				runtime_assert_string_msg(!dimensions_read, "Error in core::chemical::mainchain_potential::MainchainScoreTable::parse_rama_map_file_shapovalov(): The \"" +filename + "\" file contains more than one \"@DIMENSIONS\" line." );
 				runtime_assert( n_mainchain_torsions == dimensions.size() ); //Should be guaranteed true.
+				core::Size spline_values( 1 );
 				for ( core::Size i=1; i<=n_mainchain_torsions; ++i ) {
 					linestream >> dimensions[i];
 					check_linestream(linestream, filename, i<n_mainchain_torsions);
+					// A periodic cubic spline needs two points: with one, CubicSpline::train writes outside its matrix.
+					runtime_assert_string_msg( dimensions[i] >= 2 && dimensions[i] <= max_points_per_torsion, "Error in core::chemical::mainchain_potential::MainchainScoreTable::parse_rama_map_file_shapovalov(): The \"" + filename + "\" file's \"@DIMENSIONS\" line sets the number of grid points for mainchain torsion " + std::to_string( i ) + " to " + std::to_string( dimensions[i] ) + ", outside the allowed range of 2 to " + std::to_string( max_points_per_torsion ) + "." );
+					runtime_assert_string_msg( 2 * dimensions[i] <= max_spline_values / spline_values, "Error in core::chemical::mainchain_potential::MainchainScoreTable::parse_rama_map_file_shapovalov(): The grid that the \"" + filename + "\" file's \"@DIMENSIONS\" line describes is too large.  A spline stores 2^N values for each point of an N-dimensional grid, and may store at most " + std::to_string( max_spline_values ) + "." );
+					spline_values *= 2 * dimensions[i];
 				}
 				initialize_tensors(dimensions);
 				runtime_assert_string_msg( linestream.eof(), "Error in core::chemical::mainchain_potential::MainchainScoreTable::parse_rama_map_file_shapovalov(): Too many dimensions were specified in a \"@DIMENSIONS\" line." );

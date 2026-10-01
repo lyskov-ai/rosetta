@@ -51,6 +51,9 @@ sources = {
 		"GasteigerAtomTypeSet",
 		"GasteigerAtomTyper",
 	],
+	"chemical/mainchain_potential" :[
+		"MainchainScoreTableTests",
+	],
 	"chemical/modifications" :[
 		"Reprotonate",
 		"ValenceHandler",
