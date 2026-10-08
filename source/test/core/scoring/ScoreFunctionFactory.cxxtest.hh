@@ -22,6 +22,11 @@
 
 // Package headers
 #include <basic/database/open.hh>
+#include <utility/file/file_sys_util.hh>
+
+// C++ headers
+#include <cstdio>
+#include <fstream>
 
 #include <basic/options/option.hh>
 #include <basic/options/util.hh>
@@ -79,6 +84,29 @@ public:
 		// Database patch
 		TS_ASSERT_EQUALS( find_weights_file("score12",".wts_patch"), basic::database::full_name( "scoring/weights/score12.wts_patch" ) );
 		TS_ASSERT_EQUALS( find_weights_file("score12.wts_patch",".wts_patch"), basic::database::full_name( "scoring/weights/score12.wts_patch" ) );
+	}
+
+	/// @details A weights file in the working directory named after a database one replaces it natively. Under
+	/// WebAssembly the database comes first (basic::database::prefer_database). The test writes the file into
+	/// the working directory that test suites share, so it names a weights file no other test reads.
+	void test_find_weights_file_local_copy_replaces_database_only_natively() {
+		std::string const local( "gauss1.wts" );
+		if ( utility::file::file_exists( local ) ) {
+			TS_FAIL( ( local + " is already in the working directory" ).c_str() );
+			return;
+		}
+		{
+			std::ofstream out( local );
+			out << "# not a weights file\n";
+		}
+#ifdef __EMSCRIPTEN__
+		TS_ASSERT_EQUALS( find_weights_file("gauss1",".wts"), basic::database::full_name( "scoring/weights/gauss1.wts" ) );
+		TS_ASSERT_EQUALS( find_weights_file("gauss1.wts",".wts"), basic::database::full_name( "scoring/weights/gauss1.wts" ) );
+#else
+		TS_ASSERT_EQUALS( find_weights_file("gauss1",".wts"), local );
+		TS_ASSERT_EQUALS( find_weights_file("gauss1.wts",".wts"), local );
+#endif
+		std::remove( local.c_str() );
 	}
 
 }; //ScoreFunctionUtilityTest

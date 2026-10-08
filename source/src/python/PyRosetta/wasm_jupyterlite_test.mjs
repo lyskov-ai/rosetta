@@ -156,6 +156,33 @@ const kernel = pyodideKernel.kernel_instance;
 const interpreter = kernel.interpreter;
 mark("kernel ready");
 
+// Decoys in the kernel's working directory, which in a browser is the file
+// browser's `/drive`. Natively Rosetta tries these names there before the
+// database. Under WebAssembly the database comes first (`prefer_database` in
+// basic/database/open.hh), and `init()` passes -no_fconfig, so that it does not
+// read `common` as a flags file. The names come from a trace of the notebook's
+// session: at least one for each reader it found trying the working directory,
+// apart from the elec count-pair table, whose reader no content makes fail. Each
+// decoy holds what makes its reader fail loudly, so a cell that reads one fails
+// with an error that names it, and an empty Dunbrack directory fails the first
+// score.
+const decoys = {
+  "common": "-decoy_planted_by_the_notebook_test\n",
+  "ref2015.wts": "decoy planted by the notebook test\n",
+  "all.ramaProb": "decoy planted by the notebook test\n",
+  "code_properties.codes": "decoy planted by the notebook test\n",
+  "default.codes": "# decoy planted by the notebook test\nLEU DCY\n",
+  "scoring/score_functions/P_AA_pp/shapovalov/10deg/kappa131/a20.prop":
+    "# decoy planted by the notebook test\n0 0 DCY 0.5 0.5\n",
+};
+const workingDirectory = pyodide.FS.cwd();
+for (const [name, text] of Object.entries(decoys)) {
+  pyodide.FS.mkdirTree(path.posix.dirname(path.posix.join(workingDirectory, name)));
+  pyodide.FS.writeFile(path.posix.join(workingDirectory, name), text);
+}
+pyodide.FS.mkdirTree(path.posix.join(workingDirectory, "rotamer/shapovalov/StpDwn_0-0-0"));
+mark(`decoys planted in ${workingDirectory}`);
+
 // The worker's `execute` rebinds these callbacks for every request, to tag each
 // message with its request. One notebook needs them bound once.
 let outputs = [];

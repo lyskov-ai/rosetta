@@ -3494,12 +3494,16 @@ ScoreFunction::indicate_required_context_graphs(
 /// optional extension.
 std::string
 find_weights_file(std::string const & name, std::string const & extension/*=".wts"*/) {
-	utility::io::izstream data1( name );
-	if ( data1.good() ) {
+	bool const database_first( basic::database::prefer_database( "scoring/weights/"+name+extension )
+		|| basic::database::prefer_database( "scoring/weights/"+name ) );
+	utility::io::izstream data1;
+	if ( !database_first ) data1.open( name );
+	if ( !database_first && data1.good() ) {
 		return name;
 	} else {
-		utility::io::izstream data2( name + extension );
-		if ( data2.good() ) {
+		utility::io::izstream data2;
+		if ( !database_first ) data2.open( name + extension );
+		if ( !database_first && data2.good() ) {
 			return name + extension;
 		} else {
 			utility::io::izstream data3(  basic::database::full_name( "scoring/weights/"+name+extension, /*warn=*/false )  );

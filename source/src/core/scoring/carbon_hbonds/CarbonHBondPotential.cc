@@ -80,10 +80,11 @@ CarbonHBondPotential::read_potential()
 	//Read in data file, and fill in private data.
 	utility::io::izstream stream;
 
-	// search in the local directory first
-	stream.open( option[ ch_o_bond_potential ] );
+	// search in the local directory first, unless basic::database::prefer_database() says otherwise
+	bool const database_first( basic::database::prefer_database( option[ ch_o_bond_potential ]() ) );
+	if ( !database_first ) stream.open( option[ ch_o_bond_potential ] );
 	// then try database
-	if ( !stream.good() ) {
+	if ( database_first || !stream.good() ) {
 		stream.close();
 		basic::database::open( stream, option[ ch_o_bond_potential ] );
 	}

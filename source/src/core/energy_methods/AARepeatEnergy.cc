@@ -193,9 +193,10 @@ void AARepeatEnergy::load_penalty_table_from_file( std::string const &filename )
 	std::string filename_formatted = filename;
 	if ( utility::file::file_extension(filename_formatted)!="rpt_pen" ) filename_formatted+= ".rpt_pen";
 
+	bool const database_first( basic::database::prefer_database( "scoring/score_functions/aa_repeat_energy/" + filename_formatted ) );
 	izstream infile;
-	infile.open( filename_formatted );
-	if ( !infile.good() ) {
+	if ( !database_first ) infile.open( filename_formatted );
+	if ( database_first || !infile.good() ) {
 		filename_formatted = "scoring/score_functions/aa_repeat_energy/" + utility::file::file_basename(filename_formatted) + ".rpt_pen";
 		basic::database::open( infile, filename_formatted );
 		runtime_assert_string_msg( infile.good(), "Error in AARepeatEnergy::load_penalty_table_from_file():  Unable to open .rpt_pen file for read!" );

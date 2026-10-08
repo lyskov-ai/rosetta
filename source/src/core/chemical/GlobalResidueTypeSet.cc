@@ -907,7 +907,7 @@ GlobalResidueTypeSet::load_pdb_component( std::string const & pdb_id ) const {
 		// Skip empty lines and comments.
 		if ( line.size() < 1 || line[0] == '#' ) continue;
 
-		attempt_readin( line, pdb_id, new_rsd_type, found_file );
+		if ( !basic::database::prefer_database( line ) ) attempt_readin( line, pdb_id, new_rsd_type, found_file );
 		if ( !new_rsd_type ) {
 			attempt_readin( basic::database::full_name( line ), pdb_id, new_rsd_type, found_file );
 		}
@@ -920,9 +920,12 @@ GlobalResidueTypeSet::load_pdb_component( std::string const & pdb_id ) const {
 
 	// Now look in the directory.
 	if ( !new_rsd_type && pdb_components_directory_ != "" ) {
-		std::string db_filename = pdb_components_directory_+"/components." + pdb_id[0] + ".cif";
-		if  ( !utility::file::file_exists( db_filename ) ) db_filename = pdb_components_directory_+"/components." + pdb_id[0] + ".cif";
-		if  ( !utility::file::file_exists( db_filename ) ) db_filename = pdb_components_directory_+"/components." + pdb_id[0] + ".cif.gz";
+		std::string db_filename;
+		if ( !basic::database::prefer_database( pdb_components_directory_+"/components." + pdb_id[0] + ".cif" ) ) {
+			db_filename = pdb_components_directory_+"/components." + pdb_id[0] + ".cif";
+			if  ( !utility::file::file_exists( db_filename ) ) db_filename = pdb_components_directory_+"/components." + pdb_id[0] + ".cif";
+			if  ( !utility::file::file_exists( db_filename ) ) db_filename = pdb_components_directory_+"/components." + pdb_id[0] + ".cif.gz";
+		}
 		if  ( !utility::file::file_exists( db_filename ) ) db_filename = basic::database::full_name( pdb_components_directory_+"/components." + pdb_id[0] + ".cif" );
 		if  ( !utility::file::file_exists( db_filename ) ) db_filename = basic::database::full_name( pdb_components_directory_+"/components." + pdb_id[0] + ".cif.gz" );
 

@@ -781,7 +781,8 @@ std::string RotamerLibrary::get_library_name_10() const {
 		dirname = shap_dun10_dir_;
 	}
 	// The dun10 directory can be a non-database directory
-	if ( utility::file::file_exists( dirname ) && utility::file::is_directory( dirname ) ) {
+	if ( !basic::database::prefer_database( dirname + "/" )
+			&& utility::file::file_exists( dirname ) && utility::file::is_directory( dirname ) ) {
 		TR.Debug << "Using local directory '" << dirname << "' for dun10 library." << std::endl;
 		return dirname;
 	}

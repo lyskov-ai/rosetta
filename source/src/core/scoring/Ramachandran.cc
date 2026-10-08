@@ -967,10 +967,11 @@ Ramachandran::read_rama(
 ) {
 	utility::io::izstream  iunit;
 
-	// search in the local directory first
-	iunit.open( rama_map_filename );
+	// search in the local directory first, unless basic::database::prefer_database() says otherwise
+	bool const database_first( basic::database::prefer_database( rama_map_filename ) );
+	if ( !database_first ) iunit.open( rama_map_filename );
 
-	if ( !iunit.good() ) {
+	if ( database_first || !iunit.good() ) {
 		iunit.close();
 		if ( !basic::database::open( iunit, rama_map_filename ) ) {
 			std::stringstream err_msg;
@@ -1072,10 +1073,11 @@ Ramachandran::load_custom_rama_table(
 
 	utility::io::izstream iunit;
 
-	// search in the local directory first
-	iunit.open( filename );
+	// search in the local directory first, unless basic::database::prefer_database() says otherwise
+	bool const database_first( basic::database::prefer_database( filename ) );
+	if ( !database_first ) iunit.open( filename );
 
-	if ( !iunit.good() ) {
+	if ( database_first || !iunit.good() ) {
 		iunit.close();
 		if ( !basic::database::open( iunit, filename ) ) {
 			std::stringstream err_msg("");

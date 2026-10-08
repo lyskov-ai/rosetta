@@ -135,7 +135,7 @@ void NMerRefEnergy::read_nmer_tables_from_options() {
 void NMerRefEnergy::read_nmer_table_list( std::string const & ref_list_fname ) {
 	TR << "reading NMerRefEnergy list from " << ref_list_fname << std::endl;
 	utility::io::izstream in_stream;
-	if ( utility::file::file_exists( ref_list_fname ) ) {
+	if ( !basic::database::prefer_database( ref_list_fname ) && utility::file::file_exists( ref_list_fname ) ) {
 		in_stream.open( ref_list_fname );
 	} else {
 		in_stream.open( basic::database::full_name( ref_list_fname, false ) );
@@ -169,7 +169,7 @@ void NMerRefEnergy::read_nmer_table( std::string const & ref_fname ) {
 	TR << "checking for NMerRefEnergy scores" << std::endl;
 
 	utility::io::izstream in_stream;
-	if ( utility::file::file_exists( ref_fname ) ) {
+	if ( !basic::database::prefer_database( ref_fname ) && utility::file::file_exists( ref_fname ) ) {
 		in_stream.open( ref_fname );
 	} else {
 		in_stream.open( basic::database::full_name( ref_fname, false ) );

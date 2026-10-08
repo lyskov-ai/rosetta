@@ -361,9 +361,10 @@ void AACompositionEnergySetup::initialize_from_file( std::string const &filename
 	std::string filename_formatted = filename;
 	if ( utility::file::file_extension(filename_formatted)!="comp" ) filename_formatted+= ".comp";
 
+	bool const database_first( basic::database::prefer_database( "scoring/score_functions/aa_composition/" + filename_formatted ) );
 	izstream infile;
-	infile.open( filename_formatted );
-	if ( !infile.good() ) {
+	if ( !database_first ) infile.open( filename_formatted );
+	if ( database_first || !infile.good() ) {
 		filename_formatted = "scoring/score_functions/aa_composition/" + utility::file::file_basename(filename_formatted) + ".comp";
 		basic::database::open( infile, filename_formatted );
 		runtime_assert_string_msg( infile.good(), "Error in core::scoring::aa_composition_energy::AACompositionEnergySetup::initialize_from_file():  Unable to open .comp file for read!" );

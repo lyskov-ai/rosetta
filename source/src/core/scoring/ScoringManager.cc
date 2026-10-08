@@ -1675,7 +1675,7 @@ ScoringManager::create_file_contents_instance(
 	TR << "Reading \"" << filename << "\"." << std::endl;
 
 	std::string fname( filename );
-	if ( !utility::file::file_exists( filename ) ) {
+	if ( basic::database::prefer_database( filename ) || !utility::file::file_exists( filename ) ) {
 		fname = basic::database::full_name( filename, false );
 	}
 	utility::io::izstream in_stream( fname );
@@ -1695,7 +1695,8 @@ utility::libsvm::Svm_rosettaOP
 ScoringManager::create_svm_rosetta(
 	std::string const & filename
 ) {
-	std::string const fname( utility::file::file_exists( filename ) ? filename : basic::database::full_name( filename, false ) );
+	std::string const fname( !basic::database::prefer_database( filename ) && utility::file::file_exists( filename )
+		? filename : basic::database::full_name( filename, false ) );
 	TR << "Creating SVM object from \"" << filename << "\"." << std::endl;
 	return utility::pointer::make_shared< utility::libsvm::Svm_rosetta >( fname );
 }
@@ -1709,7 +1710,7 @@ ScoringManager::create_nmer_svm_rank(
 	std::string const & filename
 ) {
 	std::string fname( filename );
-	if ( !utility::file::file_exists( filename ) ) {
+	if ( basic::database::prefer_database( filename ) || !utility::file::file_exists( filename ) ) {
 		fname = basic::database::full_name( filename, false );
 	}
 
@@ -1759,7 +1760,7 @@ ScoringManager::create_nmer_pssm(
 	std::string const & filename, core::Size nmer_length
 ) {
 	std::string pssm_fname( filename );
-	if ( !utility::file::file_exists( pssm_fname ) ) {
+	if ( basic::database::prefer_database( pssm_fname ) || !utility::file::file_exists( pssm_fname ) ) {
 		pssm_fname = basic::database::full_name( pssm_fname, false );
 	}
 	TR << "reading NMerPSSMEnergy scores from " << pssm_fname << std::endl;
@@ -1804,7 +1805,7 @@ ScoringManager::create_nmer_svm_aa_matrix(
 	std::string const & filename
 ) {
 	std::string fname( filename );
-	if ( !utility::file::file_exists( filename ) ) {
+	if ( basic::database::prefer_database( filename ) || !utility::file::file_exists( filename ) ) {
 		fname = basic::database::full_name( filename, false );
 	}
 
@@ -1870,9 +1871,10 @@ ScoringManager::create_mhc_map_from_db(std::string const &filename)
 	std::string db_filename = ""; //Actual location of the db filename
 	// Look for a copy of the file
 	utility::io::izstream infile;
-	infile.open( filename );
+	bool const database_first( basic::database::prefer_database( "scoring/score_functions/mhc_epitope/"+filename ) );
+	if ( !database_first ) infile.open( filename );
 	// If the filename is found, store in db_filename.  Otherwise, look in the database.
-	if ( infile.good() ) {
+	if ( !database_first && infile.good() ) {
 		db_filename = filename;
 	} else {
 		db_filename = basic::database::full_name("scoring/score_functions/mhc_epitope/"+filename);
@@ -1935,9 +1937,10 @@ ScoringManager::create_mhc_csv_contents(std::string const &filename)
 	std::string db_filename = ""; //Actual location of the db filename
 	// Look for a copy of the file
 	izstream infile;
-	infile.open( filename );
+	bool const database_first( basic::database::prefer_database( "scoring/score_functions/mhc_epitope/"+filename ) );
+	if ( !database_first ) infile.open( filename );
 	// If the filename is found, store in db_filename.  Otherwise, look in the database.
-	if ( infile.good() ) {
+	if ( !database_first && infile.good() ) {
 		db_filename = filename;
 	} else {
 		db_filename = basic::database::full_name("scoring/score_functions/mhc_epitope/"+filename);

@@ -102,6 +102,21 @@ full_name(
 	return option[ in::path::database ](1).name() + db_file;
 }
 
+bool
+prefer_database( std::string const & db_file )
+{
+#ifdef __EMSCRIPTEN__
+	using utility::file::file_exists;
+	using utility::file::is_directory;
+	std::string const fname( full_name( db_file, /*warn=*/false ) );
+	if ( !db_file.empty() && db_file.back() == '/' ) return is_directory( fname );
+	return ( file_exists( fname ) && !is_directory( fname ) ) || ( file_exists( fname + ".gz" ) && !is_directory( fname + ".gz" ) );
+#else
+	(void) db_file;
+	return false;
+#endif
+}
+
 /// @brief Find a path to a file.
 ///
 /// Try various combinations to locate the specific file being requested by the user.
@@ -119,8 +134,10 @@ find_database_path(
 
 	std::string const & path( basic::database::full_name( dir ) );
 
-	izstream potential_file( filename );
-	if ( potential_file.good() ) {
+	bool const database_first( prefer_database( dir + filename ) );
+	izstream potential_file;
+	if ( !database_first ) potential_file.open( filename );
+	if ( !database_first && potential_file.good() ) {
 		return filename;
 	} else {
 		izstream potential_file2( path + filename);  // Let's assume it's in the database in the usual spot.
@@ -153,12 +170,15 @@ find_database_path( std::string const & dir, std::string const & filename, std::
 
 	std::string const & path( basic::database::full_name( dir ) );
 
-	izstream potential_file( filename );
-	if ( potential_file.good() ) {
+	bool const database_first( prefer_database( dir + filename ) || prefer_database( dir + filename + ext ) );
+	izstream potential_file;
+	if ( !database_first ) potential_file.open( filename );
+	if ( !database_first && potential_file.good() ) {
 		return filename;
 	} else {
-		izstream potential_file2( filename + ext );  // Perhaps the user didn't use the .table extension.
-		if ( potential_file2.good() ) {
+		izstream potential_file2;
+		if ( !database_first ) potential_file2.open( filename + ext );  // Perhaps the user didn't use the .table extension.
+		if ( !database_first && potential_file2.good() ) {
 			return filename + ext;
 		} else {
 			izstream potential_file3( path + filename);  // Let's assume it's in the database in the usual spot.

@@ -98,9 +98,10 @@ void NetChargeEnergySetup::initialize_from_file( std::string const &filename ) {
 	std::string filename_formatted = filename;
 	if ( utility::file::file_extension(filename_formatted)!="charge" ) filename_formatted+= ".charge";
 
+	bool const database_first( basic::database::prefer_database( "scoring/score_functions/netcharge/" + filename_formatted ) );
 	izstream infile;
-	infile.open( filename_formatted );
-	if ( !infile.good() ) {
+	if ( !database_first ) infile.open( filename_formatted );
+	if ( database_first || !infile.good() ) {
 		filename_formatted = "scoring/score_functions/netcharge/" + utility::file::file_basename(filename_formatted) + ".charge";
 		basic::database::open( infile, filename_formatted );
 		runtime_assert_string_msg( infile.good(), "Error in core::scoring::netcharge_energy::NetChargeEnergySetup::initialize_from_file():  Unable to open .charge file for read!" );

@@ -154,7 +154,7 @@ void NMerPSSMEnergy::read_nmer_pssms_from_options() {
 
 //read energy table list
 void NMerPSSMEnergy::read_nmer_pssm_list( std::string pssm_list_fname ) {
-	if ( !utility::file::file_exists( pssm_list_fname ) ) {
+	if ( basic::database::prefer_database( pssm_list_fname ) || !utility::file::file_exists( pssm_list_fname ) ) {
 		pssm_list_fname = basic::database::full_name( pssm_list_fname, false );
 	}
 	TR << "reading NMerPSSMEnergy list from " << pssm_list_fname << std::endl;

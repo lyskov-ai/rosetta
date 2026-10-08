@@ -45,11 +45,12 @@ read_cp_tables_from_db(
 
 	CPRepMapTypeOP cp_rep_map_byname( new CPRepMapType );
 
-	// search in the local directory first
+	// search in the local directory first, unless basic::database::prefer_database() says otherwise
 	utility::io::izstream iunit;
-	iunit.open( filename );
+	bool const database_first( basic::database::prefer_database( filename ) );
+	if ( !database_first ) iunit.open( filename );
 
-	if ( !iunit.good() ) {
+	if ( database_first || !iunit.good() ) {
 		iunit.close();
 		if ( !basic::database::open( iunit, filename ) ) {
 			std::stringstream err_msg;

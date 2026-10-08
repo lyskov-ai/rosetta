@@ -368,14 +368,17 @@ NomenclatureManager::find_alternate_codes_file( std::string const & filename ) c
 	std::string const & path( basic::database::full_name( "input_output/3-letter_codes/" ) );
 	std::string const ext( ".codes" );
 
-	izstream potential_file( filename );
-	if ( potential_file.good() ) {
-		return filename;
-	}
+	if ( !basic::database::prefer_database( "input_output/3-letter_codes/" + filename )
+			&& !basic::database::prefer_database( "input_output/3-letter_codes/" + filename + ext ) ) {
+		izstream potential_file( filename );
+		if ( potential_file.good() ) {
+			return filename;
+		}
 
-	izstream potential_file2( filename + ext );  // Perhaps the user didn't use the .codes extension.
-	if ( potential_file2.good() ) {
-		return filename + ext;
+		izstream potential_file2( filename + ext );  // Perhaps the user didn't use the .codes extension.
+		if ( potential_file2.good() ) {
+			return filename + ext;
+		}
 	}
 
 	izstream potential_file3( path + filename);  // Let's assume it's in the database in the usual spot.

@@ -64,10 +64,13 @@ void read_rama_map_file_shapovalov(
 	//   1) filename
 	//   2) $DATABASE/[rama_pp_map]/filename
 	//   3) $DATABASE/filename
-	iunit.open( filename );
-	if ( !iunit.good() ) {
+	// Under WebAssembly, 1) is skipped when the database has the file (see basic::database::prefer_database).
+	// basic::database::open throws rather than return false, so this never reaches 3).
+	std::string full_filename = std::string(option[ corrections::score::rama_pp_map]())+"/"+filename;
+	bool const database_first( basic::database::prefer_database( full_filename ) );
+	if ( !database_first ) iunit.open( filename );
+	if ( database_first || !iunit.good() ) {
 		iunit.close();
-		std::string full_filename = std::string(option[ corrections::score::rama_pp_map]())+"/"+filename;
 		if ( !basic::database::open( iunit, full_filename ) ) {
 			if ( !basic::database::open( iunit, filename ) ) {
 				std::stringstream err_msg;
@@ -112,10 +115,12 @@ void read_rama_map_file_shapovalov(
 	//   1) filename
 	//   2) $DATABASE/[rama_pp_map]/filename
 	//   3) $DATABASE/filename
-	iunit.open( filename );
-	if ( !iunit.good() ) {
+	// Under WebAssembly, 1) is skipped when the database has the file (see basic::database::prefer_database).
+	std::string full_filename = std::string(option[ corrections::score::rama_pp_map]())+"/"+filename;
+	bool const database_first( basic::database::prefer_database( full_filename ) || basic::database::prefer_database( filename ) );
+	if ( !database_first ) iunit.open( filename );
+	if ( database_first || !iunit.good() ) {
 		iunit.close();
-		std::string full_filename = std::string(option[ corrections::score::rama_pp_map]())+"/"+filename;
 
 		//see if fullfilename exists (this is a waste but db::open throws an exception if file does not exist)
 		utility::io::izstream temp( basic::database::full_name( full_filename, false ) );

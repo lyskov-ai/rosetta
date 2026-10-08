@@ -103,9 +103,10 @@ void BinTransitionCalculator::load_bin_params( std::string const &filename ) {
 	//Format the filename:
 	bin_params_file_ = filename;
 	if ( utility::file::file_extension(bin_params_file_)!="bin_params" ) bin_params_file_ += ".bin_params";
+	bool const database_first( basic::database::prefer_database( "protocol_data/generalizedKIC/bin_params/" + bin_params_file_ ) );
 	izstream infile;
-	infile.open( bin_params_file_ );
-	if ( !infile.good() ) {
+	if ( !database_first ) infile.open( bin_params_file_ );
+	if ( database_first || !infile.good() ) {
 		bin_params_file_ = "protocol_data/generalizedKIC/bin_params/" + utility::file::file_basename(bin_params_file_) + ".bin_params";
 		basic::database::open( infile, bin_params_file_ );
 		runtime_assert_string_msg( infile.good(),

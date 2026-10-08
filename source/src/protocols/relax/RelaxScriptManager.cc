@@ -178,8 +178,19 @@ RelaxScriptManager::script_file_path(
 	bool const dualspace
 ) const {
 
+	std::string script_file_path(script_file);
+	if ( nearest_sfxn_name != "" ) {
+		script_file_path += "." + nearest_sfxn_name;
+	}
+	if ( dualspace ) {
+		script_file_path += ".dualspace";
+	}
+	script_file_path += ".txt";
+
 	//General Case: First check if file exists locally, then check database. Add dualspace extension if necessary
-	if ( utility::file::file_exists( script_file ) ) {
+	//Under WebAssembly, the database comes first (see basic::database::prefer_database).
+	if ( !basic::database::prefer_database( "sampling/relax_scripts/" + script_file_path )
+			&& utility::file::file_exists( script_file ) ) {
 		//the user is providing their own script
 		return script_file;
 	} else { //let's look in the database
@@ -188,15 +199,6 @@ RelaxScriptManager::script_file_path(
 		if ( position_of_first_period != std::string::npos ) {
 			handle_script_file_with_period( script_file, position_of_first_period );
 		}
-
-		std::string script_file_path(script_file);
-		if ( nearest_sfxn_name != "" ) {
-			script_file_path += "." + nearest_sfxn_name;
-		}
-		if ( dualspace ) {
-			script_file_path += ".dualspace";
-		}
-		script_file_path += ".txt";
 
 		TR << "Looking for " << script_file_path << std::endl;
 

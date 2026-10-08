@@ -94,9 +94,10 @@ void MHCEpitopePredictorExternal::connect(std::string const & filename)
 	std::string db_filename = ""; //Actual location of the db filename
 	// Look for a copy of the file
 	utility::io::izstream infile;
-	infile.open( filename );
+	bool const database_first( basic::database::prefer_database( "scoring/score_functions/mhc_epitope/"+filename ) );
+	if ( !database_first ) infile.open( filename );
 	// If the filename is found, store in db_filename.  Otherwise, look in the database.
-	if ( infile.good() ) {
+	if ( !database_first && infile.good() ) {
 		db_filename = filename;
 	} else {
 		db_filename = basic::database::full_name("scoring/score_functions/mhc_epitope/"+filename);

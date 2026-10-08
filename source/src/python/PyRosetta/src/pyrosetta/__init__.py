@@ -149,6 +149,9 @@ def init(options='-ex1 -ex2aro', extra_options='', set_logging_handler=None, not
     Under WebAssembly, '-out:file:dont_rewrite_dunbrack_database' is also passed,
     ahead of options, so that Rosetta does not write its Dunbrack binary cache into
     the database. Pass '-out:file:dont_rewrite_dunbrack_database false' to write it.
+    So is '-no_fconfig', so that Rosetta does not read a flags file named 'common'
+    from the working directory or ~/.rosetta/flags. Pass '-no_fconfig false' to
+    read it.
 
     Examples:
         init()                     # uses default flags
@@ -189,8 +192,14 @@ def init(options='-ex1 -ex2aro', extra_options='', set_logging_handler=None, not
     # session ends. So under WebAssembly the write is off by default, including in
     # a Pyodide venv under Node, which could have reused the file. The flag goes
     # first, so that the caller's options can turn it back on.
+    #
+    # Rosetta also reads any file named 'common' in the working directory as a
+    # flags file. In a JupyterLite kernel that is the file browser's /drive,
+    # which persists between sessions, so a file left there could set any option,
+    # such as -database. Under WebAssembly that is off by default too.
     if sys.platform == 'emscripten':
         args.append('-out:file:dont_rewrite_dunbrack_database')
+        args.append('-no_fconfig')
     args += options + extra_options
 
     # Attempt to resolve database location from environment if not present, else fallback

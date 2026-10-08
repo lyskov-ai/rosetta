@@ -128,7 +128,10 @@ SingleNCAARotamerLibraryCreator::create( core::chemical::ResidueType const & res
 		pveci++;
 	}
 
-	if ( !rotlib_in.good() || !tried ) {
+	// Under WebAssembly, the database comes before the relative file name (see basic::database::prefer_database).
+	bool const database_first( basic::database::prefer_database( file_name )
+		|| basic::database::prefer_database( "/rotamer/ncaa_rotlibs/" + file_name ) );
+	if ( ( !rotlib_in.good() || !tried ) && !database_first ) {
 		// if the priority paths don't yield a hit, try the relative file name.
 		tried=true;
 		dir_name = "";

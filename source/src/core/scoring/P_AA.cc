@@ -208,23 +208,19 @@ P_AA::read_P_AA_pp()
 		TR << "shapovalov_lib::shap_p_aa_pp_smooth_level of " << _smoothingRequsted << "( aka " << _smoothingAsKeyword << " )" << " got activated." << std::endl;
 	}
 
-	// search in the local directory first
-	if ( !basic::options::option[basic::options::OptionKeys::corrections::shapovalov_lib_fixes_enable]
-			|| !basic::options::option[basic::options::OptionKeys::corrections::shapovalov_lib::shap_p_aa_pp_enable] ) {
-		stream.open( option[ p_aa_pp ] );
-	} else {
-		stream.open( option[ shap_p_aa_pp ] );
-	}
+	std::string const p_aa_pp_file(
+		!basic::options::option[basic::options::OptionKeys::corrections::shapovalov_lib_fixes_enable]
+		|| !basic::options::option[basic::options::OptionKeys::corrections::shapovalov_lib::shap_p_aa_pp_enable]
+		? option[ p_aa_pp ]() : option[ shap_p_aa_pp ]() );
+	bool const database_first( basic::database::prefer_database( p_aa_pp_file ) );
+
+	// search in the local directory first, unless basic::database::prefer_database() says otherwise
+	if ( !database_first ) stream.open( p_aa_pp_file );
 
 	// then database
-	if ( !stream.good() ) {
+	if ( database_first || !stream.good() ) {
 		stream.close();
-		if ( !basic::options::option[basic::options::OptionKeys::corrections::shapovalov_lib_fixes_enable]
-				|| !basic::options::option[basic::options::OptionKeys::corrections::shapovalov_lib::shap_p_aa_pp_enable] ) {
-			basic::database::open(stream, option[p_aa_pp]);
-		} else {
-			basic::database::open(stream, option[shap_p_aa_pp]);
-		}
+		basic::database::open( stream, p_aa_pp_file );
 	}
 
 	if ( !stream.good() ) utility_exit_with_message( "Unable to open p_aa_pp map!" );

@@ -98,9 +98,10 @@ void MHCEpitopeEnergySetup::initialize_from_file( std::string const &filename ) 
 	std::string filename_formatted = filename;
 	if ( utility::file::file_extension(filename_formatted)!="mhc" ) filename_formatted+= ".mhc";
 
+	bool const database_first( basic::database::prefer_database( "scoring/score_functions/mhc_epitope/" + filename_formatted ) );
 	izstream infile;
-	infile.open( filename_formatted );
-	if ( !infile.good() ) {
+	if ( !database_first ) infile.open( filename_formatted );
+	if ( database_first || !infile.good() ) {
 		TR << "Cannot find .mhc file " << filename_formatted << ".  Checking the Rosetta database." << std::endl;
 		filename_formatted = "scoring/score_functions/mhc_epitope/" + utility::file::file_basename(filename_formatted) + ".mhc";
 		basic::database::open( infile, filename_formatted );

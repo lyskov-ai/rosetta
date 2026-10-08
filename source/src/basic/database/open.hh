@@ -51,6 +51,18 @@ full_name(
 	bool warn = true
 );
 
+/// @brief Whether a reader that tries a relative name in the working directory before the database
+/// should go straight to the database for it.
+///
+/// @details  Natively, always false: a file in the working directory overrides the database file of
+/// the same name. Under WebAssembly, true when the database holds a file named @p db_file, or @p db_file
+/// plus ".gz", so the database comes first and a name it lacks still falls back to the working directory.
+/// A directory does not count, unless @p db_file ends in '/'. There the working directory is a JupyterLite
+/// kernel's /drive, which persists between sessions, so a file left there would otherwise replace a
+/// database file without any code naming it.
+bool
+prefer_database( std::string const & db_file );
+
 /// @brief Find a path to a file.
 ///
 /// Try various combinations to locate the specific file being requested by the user.
