@@ -207,9 +207,11 @@ get_crick_params_filename_formatted(
 	std::string filename_formatted( basename );
 	if ( utility::file::file_extension(filename_formatted)!="crick_params" ) filename_formatted+= ".crick_params";
 
+	// Under WebAssembly, the database comes first (see basic::database::prefer_database).
+	bool const database_first( basic::database::prefer_database( "protocol_data/crick_parameters/" + filename_formatted ) );
 	izstream infile;
-	infile.open( filename_formatted );
-	if ( !infile.good() ) {
+	if ( !database_first ) infile.open( filename_formatted );
+	if ( database_first || !infile.good() ) {
 		filename_formatted = "protocol_data/crick_parameters/" + utility::file::file_basename(filename_formatted) + ".crick_params";
 		basic::database::open( infile, filename_formatted );
 		runtime_assert_string_msg( infile.good(), "In protocols::helical_bundle::get_crick_params_filename_formatted(): Unable to open .crick_params file \"" + basename + "\" for read!" );
@@ -242,9 +244,10 @@ void read_minor_helix_params (
 
 	std::string const filename_formatted( get_crick_params_filename_formatted(filename) );
 
+	bool const database_first( basic::database::prefer_database( filename_formatted ) );
 	izstream infile;
-	infile.open( filename_formatted );
-	if ( !infile.good() ) {
+	if ( !database_first ) infile.open( filename_formatted );
+	if ( database_first || !infile.good() ) {
 		basic::database::open( infile, filename_formatted );
 	}
 	runtime_assert_string_msg( infile.good(), "In protocols::helical_bundle::read_minor_helix_params(): Unable to open .crick_params file \"" + filename_formatted + "\" for read!" );
